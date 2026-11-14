@@ -1,0 +1,20 @@
+---
+galaxy_info:
+  role_name: openstint_decoder
+  author: Sturgeon Technologies LLC
+  description: >-
+    Provisions a Raspberry Pi or Ubuntu host + RTL-SDR as an OpenStint RC lap-timing decoder
+    (upstream openstint package from its pinned apt repo or built from a pinned
+    commit, /etc/openstint.conf) and
+    installs the openstint-learn helper for registering RC4 transponders.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - trixie
+    - name: Ubuntu
+      versions:
+        - noble
+        - resolute
+dependencies: []

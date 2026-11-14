@@ -1,0 +1,72 @@
+---
+# defaults/main.yml — race_hotspot role
+#
+# Event access point on the Pi's built-in Wi-Fi (always; the only Wi-Fi the
+# kit uses; the Pi's own internet and the race-control UI are on eth0). A new
+# device gets a captive portal at http://race, which lets it through to the
+# internet over eth0 (NAT) and sends it on to the lap counter app, the same
+# page the wired side uses (check-in, live/race status, kiosk).
+# DHCP/DNS come from the race_dns role (pulled in via meta/main.yml).
+
+# ── Access point ────────────────────────────────────────────────────────
+race_hotspot_interface: "wlan0"
+race_hotspot_ssid: "RC Race Event"
+# Empty = open network (spectators). 8–63 chars = WPA2-PSK. Keep a real one in
+# vault/inventory, not here.
+race_hotspot_passphrase: ""
+# Regulatory domain; Raspberry Pi OS keeps Wi-Fi rfkill-blocked until set.
+race_hotspot_country: "US"
+race_hotspot_band: "bg" # 2.4 GHz: best range and every phone supports it
+race_hotspot_channel: 6
+
+# ── Addressing (passed to race_dns) ─────────────────────────────────────
+# 10.77/24 is unlikely to collide with a track's own LAN. If you change the
+# prefix, change the netmask and DHCP pool to match.
+race_hotspot_address: "10.77.0.1"
+race_hotspot_prefix: 24
+race_hotspot_netmask: "255.255.255.0"
+race_hotspot_dhcp_start: "10.77.0.50"
+race_hotspot_dhcp_end: "10.77.0.250"
+race_hotspot_hostname: "race"
+race_hotspot_domain: "lan"
+
+# ── Internet sharing ────────────────────────────────────────────────────
+# Interfaces hotspot clients are NATed out of once let through. eth0 is the
+# Pi's only uplink.
+race_hotspot_uplinks:
+  - eth0
+# How long a device stays let through after opening the portal. Matches the
+# DHCP lease so an address rarely changes hands while still allowed.
+race_hotspot_access_timeout: "12h"
+
+# Ports hotspot clients may reach on the Pi itself. Everything else on the Pi
+# (SSH, the decoder's ZeroMQ feed) is closed to the open Wi-Fi.
+race_hotspot_input_tcp_ports: [53, 80]
+race_hotspot_input_udp_ports: [53, 67]
+
+# ── Portal ──────────────────────────────────────────────────────────────
+race_hotspot_portal_title: "RC Race Event"
+race_hotspot_portal_port: 80
+# The lap counter app. The portal serves it on port 80 by proxying to
+# 127.0.0.1:<this>, so the event address is just http://race/ (and
+# http://<pi>.local/ on the wired side). This port is NOT opened on the hotspot.
+# Follows lapcounter_app_web_port when that's set in the inventory.
+# 0 = no app: always show the portal's own page.
+race_hotspot_app_port: "{{ lapcounter_app_web_port | default(8080) }}"
+
+# ── Wired side (eth0) ───────────────────────────────────────────────────
+# The portal also listens on the wired network and is published over mDNS as
+# http://<pi hostname>.local/, which serves the app (proxied) too. So
+# the timing-table laptop and the hotspot land on the same page. (A bare
+# `race` only resolves on the hotspot.) Wired clients get no internet grant;
+# they aren't routed through the Pi.
+race_hotspot_web_on_eth0: true
+race_hotspot_web_eth0_interface: "eth0"
+# Who on the wired side may open it, when ufw is in use. "any" because a
+# track's LAN isn't known at provisioning time; set a CIDR to narrow it.
+race_hotspot_web_eth0_allowed_cidr: "any"
+
+# ── ufw ────────────────────────────────────────────────────────────────
+# ufw's default deny (incoming and routed) would block DHCP/DNS/portal and
+# forwarding. When ufw is in use, the role adds the matching allow rules.
+race_hotspot_manage_ufw: "{{ openstint_decoder_manage_ufw | default(false) }}"

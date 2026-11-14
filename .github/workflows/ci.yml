@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ansible-core ansible-lint pytest pyzmq boto3
+      - run: ansible-galaxy collection install -r collections/requirements.yml
+      - name: Syntax check
+        run: |
+          for p in provision_race_decoder configure_network deploy_lapcounter_app site; do
+            ansible-playbook -i inventory/race_decoders.yml "$p.yml" --syntax-check
+          done
+      - run: ansible-lint
+      - name: race_network validation (good passes, bad cases fail)
+        run: ansible-playbook -i localhost, roles/race_network/tests/validate_localhost.yml
+      - run: python -m pytest roles -q
+
+  # Real run of openstint_decoder's source build on Ubuntu, both arches, then
+  # a second run that must change nothing.
+  openstint-ubuntu:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ansible-core
+      - run: ansible-galaxy collection install -r collections/requirements.yml
+      - name: Provision (builds the .deb)
+        run: |
+          ansible-playbook -i localhost, roles/openstint_decoder/tests/ubuntu_localhost.yml \
+            -e ansible_python_interpreter=/usr/bin/python3
+      - name: Rerun must be idempotent
+        run: |
+          ansible-playbook -i localhost, roles/openstint_decoder/tests/ubuntu_localhost.yml \
+            -e ansible_python_interpreter=/usr/bin/python3 | tee rerun.log
+          grep -Eq 'changed=0 +unreachable=0 +failed=0' rerun.log
+      - name: Verify the package and service
+        run: |
+          set -eux
+          dpkg-query -W -f='${Version} ${Architecture}\n' openstint
+          dpkg-query -W -f='${Depends}\n' openstint
+          for bin in openstint_rtlsdr openstint_hackrf; do
+            "$bin" -h 2>&1 | grep -q '^Usage: '
+          done
+          systemctl is-enabled openstint.service
+          test -x /usr/local/bin/openstint-learn
+          grep -q -- '-p 5556' /etc/openstint.conf

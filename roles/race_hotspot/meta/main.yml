@@ -1,0 +1,27 @@
+---
+galaxy_info:
+  role_name: race_hotspot
+  author: Sturgeon Technologies LLC
+  description: >-
+    Event Wi-Fi access point on the lap counter Pi with a captive portal to
+    http://race, then NATed internet through the uplink.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - trixie
+    - name: Ubuntu
+      versions:
+        - noble
+dependencies:
+  - role: race_dns
+    vars:
+      race_dns_interface: "{{ race_hotspot_interface }}"
+      race_dns_address: "{{ race_hotspot_address }}"
+      race_dns_netmask: "{{ race_hotspot_netmask }}"
+      race_dns_dhcp_start: "{{ race_hotspot_dhcp_start }}"
+      race_dns_dhcp_end: "{{ race_hotspot_dhcp_end }}"
+      race_dns_lease_time: "{{ race_hotspot_access_timeout }}"
+      race_dns_hostname: "{{ race_hotspot_hostname }}"
+      race_dns_domain: "{{ race_hotspot_domain }}"

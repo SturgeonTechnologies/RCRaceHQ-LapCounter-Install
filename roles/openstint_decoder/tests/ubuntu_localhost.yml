@@ -1,0 +1,13 @@
+---
+# CI only (.github/workflows/ci.yml, job openstint-ubuntu): run the role
+# against the Ubuntu runner itself to prove the source build installs and
+# the service starts. No SDR there; the unit just retries.
+- name: Provision OpenStint on this Ubuntu host
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+  vars:
+    openstint_decoder_registry_users: ["{{ lookup('env', 'USER') }}"]
+  roles:
+    - openstint_decoder

@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""openstint-learn — learn one RC4 transponder and file it under its label number.
+
+Usage:
+    openstint-learn 8954097
+    openstint-learn 8954097 --host decoder.local --dir /var/lib/openstint
+
+Works against the decoder that is already running (openstint.service); it does
+not touch the radio. The decoder learns on its own whenever a transponder sits
+still on the loop. This script listens on the decoder's ZeroMQ feed for
+`L … DONE <id> <n>`, then renames the auto-numbered `<id>.rc4` (1000–9999) to
+`<label>.rc4`. The decoder rescans its folder about once a second, so the new
+name goes live without a restart. Afterwards it waits for one passing with the
+label number to prove it worked.
+
+Exit codes: 0 learned, 1 bad input or file problem, 2 timed out waiting for
+DONE, 3 the transponder is already known under another number.
+"""
+
+import argparse
+import enum
+import pathlib
+import sys
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_TIMEOUT = 2
+EXIT_MISMATCH = 3
+
+AUTO_MIN, AUTO_MAX = 1000, 9999  # decoder's auto-numbering range (src/rc4.cpp)
+
+
+@dataclass(frozen=True)
+class Message:
+    kind: str
+    event: str = ""
+    transponder_id: Optional[int] = None
+    value: Optional[float] = None
+    received: Optional[int] = None
+    processed: Optional[int] = None
+
+
+class Action(enum.Enum):
+    RENAME = "rename"
+    ALREADY_LABEL = "already_label"
+    MISMATCH = "mismatch"
+
+
+def parse_message(raw: str) -> Optional[Message]:
+    """Parse one decoder message (docs/decoder-protocol.md). None if malformed."""
+    parts = raw.split()
+    if len(parts) < 3:
+        return None
+    try:
+        int(parts[1])  # decoder timestamp; validates the shape
+        if parts[0] == "L":
+            event = parts[2]
+            if event == "DONE" and len(parts) >= 5:
+                return Message("L", event, int(parts[3]), float(parts[4]))
+            if event == "START" and len(parts) >= 4:
+                return Message("L", event, value=float(parts[3]))
+            if event in ("INTERRUPTED", "RESET"):
+                return Message("L", event)
+            return None
+        if parts[0] == "S" and len(parts) >= 6:
+            return Message("S", value=float(parts[2]),
+                           received=int(parts[4]), processed=int(parts[5]))
+        if parts[0] == "P" and len(parts) >= 5:
+            return Message("P", parts[2], int(parts[3]), float(parts[4]))
+    except ValueError:
+        return None
+    return None
+
+
+def validate_label(label: int) -> None:
+    if label <= 0:
+        raise ValueError("label number must be positive")
+    if AUTO_MIN <= label <= AUTO_MAX:
+        raise ValueError(
+            f"{label} is inside the decoder's auto-numbering range "
+            f"({AUTO_MIN}-{AUTO_MAX}); it would collide with new learns")
+
+
+def decide_done(done_id: int, label: int) -> Action:
+    if done_id == label:
+        return Action.ALREADY_LABEL
+    if AUTO_MIN <= done_id <= AUTO_MAX:
+        return Action.RENAME
+    return Action.MISMATCH
+
+
+def stray_auto_files(directory: pathlib.Path) -> list:
+    """Auto-numbered files nobody renamed yet. They confuse who is who."""
+    found = []
+    for path in directory.glob("*.rc4"):
+        if path.stem.isdigit() and AUTO_MIN <= int(path.stem) <= AUTO_MAX:
+            found.append(path.name)
+    return sorted(found)
+
+
+def rename_learned(directory: pathlib.Path, auto_id: int, label: int,
+                   wait_s: float = 3.0) -> pathlib.Path:
+    source = directory / f"{auto_id}.rc4"
+    target = directory / f"{label}.rc4"
+    deadline = time.monotonic() + wait_s
+    while not source.exists():
+        if time.monotonic() > deadline:
+            raise FileNotFoundError(f"{source} never appeared (is --dir the decoder's -s folder?)")
+        time.sleep(0.05)
+    if target.exists():
+        raise FileExistsError(f"{target} already exists; not overwriting it")
+    source.rename(target)
+    return target
+
+
+def _subscribe(host: str, port: int):
+    import zmq  # imported late so --help and the unit tests work without pyzmq
+
+    sock = zmq.Context.instance().socket(zmq.SUB)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.connect(f"tcp://{host}:{port}")
+    sock.setsockopt_string(zmq.SUBSCRIBE, "")
+    return sock
+
+
+def _messages(sock, timeout_s: float):
+    """Yield parsed messages until timeout_s passes with the generator alive."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            return
+        if sock.poll(min(remaining_ms, 250)):
+            msg = parse_message(sock.recv_string())
+            if msg is not None:
+                yield msg
+
+
+def _wait_for_done(sock, timeout_s: float) -> Optional[Message]:
+    for msg in _messages(sock, timeout_s):
+        if msg.kind == "S":
+            print(f"\r  signal: {msg.received:4d} frames/s, {msg.processed:4d} clean, "
+                  f"noise {msg.value:.1f} dB   ", end="", flush=True)
+        elif msg.kind == "L":
+            print()
+            if msg.event == "START":
+                print(f"  learning started (RSSI {msg.value:.1f}); hands off for ~15 s")
+            elif msg.event == "INTERRUPTED":
+                print("  INTERRUPTED: signal moved or dropped; keep it still, it retries by itself")
+            elif msg.event == "DONE":
+                return msg
+    print()
+    return None
+
+
+def _verify(sock, label: int, timeout_s: float) -> bool:
+    print(f"Now pass it over the loop (lift it away and bring it back). "
+          f"Waiting up to {timeout_s:.0f} s for 'P … {label}' …")
+    for msg in _messages(sock, timeout_s):
+        if msg.kind == "P" and msg.transponder_id == label:
+            print(f"Verified: passing seen for {label} (RSSI {msg.value:.1f}).")
+            return True
+    print(f"WARNING: no passing for {label} yet. The file is saved; check "
+          f"`journalctl -u openstint -f` for 'RC4 transpoder loaded: {label}'.")
+    return False
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("label", type=int, help="number printed on the transponder")
+    ap.add_argument("--host", default="127.0.0.1", help="decoder host (default: local)")
+    ap.add_argument("--port", type=int, default=5556, help="decoder ZeroMQ port")
+    ap.add_argument("--dir", default="/var/lib/openstint", type=pathlib.Path,
+                    help="decoder's .rc4 folder (its -s directory); must be local")
+    ap.add_argument("--timeout", type=float, default=180, help="seconds to wait for DONE")
+    ap.add_argument("--verify-timeout", type=float, default=60,
+                    help="seconds to wait for a passing afterwards (0 = skip)")
+    args = ap.parse_args(argv)
+
+    try:
+        validate_label(args.label)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if not args.dir.is_dir():
+        print(f"error: {args.dir} is not a folder", file=sys.stderr)
+        return EXIT_ERROR
+    if (args.dir / f"{args.label}.rc4").exists():
+        print(f"{args.label} is already learned ({args.dir / f'{args.label}.rc4'}). "
+              f"Delete that file first to re-learn it.")
+        return EXIT_OK
+    strays = stray_auto_files(args.dir)
+    if strays:
+        print(f"note: un-renamed files in {args.dir}: {', '.join(strays)}. "
+              f"Rename or delete them so they don't get mixed up with this one.")
+
+    sock = _subscribe(args.host, args.port)
+    try:
+        print(f"Learning {args.label}: power ONLY this transponder, set it flat on the "
+              f"loop or pad, then take your hands away.")
+        done = _wait_for_done(sock, args.timeout)
+        if done is None:
+            print(f"Timed out after {args.timeout:.0f} s with no DONE. Is openstint "
+                  f"running and is the transponder on the loop?")
+            return EXIT_TIMEOUT
+
+        action = decide_done(done.transponder_id, args.label)
+        if action is Action.MISMATCH:
+            print(f"This transponder is already known as {done.transponder_id}, not "
+                  f"{args.label}. Check the label, or delete {done.transponder_id}.rc4 "
+                  f"and run this again.")
+            return EXIT_MISMATCH
+        if action is Action.RENAME:
+            try:
+                target = rename_learned(args.dir, done.transponder_id, args.label)
+            except (FileNotFoundError, FileExistsError, PermissionError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return EXIT_ERROR
+            print(f"Learned: {done.transponder_id}.rc4 -> {target.name} "
+                  f"({int(done.value)} payloads).")
+        else:
+            print(f"Learned: decoder already reports it as {args.label}.")
+
+        if args.verify_timeout > 0:
+            _verify(sock, args.label, args.verify_timeout)
+        return EXIT_OK
+    finally:
+        sock.close()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\ncancelled")
+        sys.exit(130)

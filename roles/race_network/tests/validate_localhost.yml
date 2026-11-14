@@ -1,0 +1,47 @@
+---
+# Runs only the role's validation against sample settings, on localhost.
+#   ansible-playbook -i localhost, roles/race_network/tests/validate_localhost.yml
+# Good settings must pass; each bad case must fail.
+- name: Defaults pass (eth0 on DHCP)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Validate
+      ansible.builtin.include_role:
+        name: race_network
+        tasks_from: validate.yml
+
+- name: Static settings pass
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    race_network_hostname: rcclub-track1
+    race_network_ethernet_mode: static
+    race_network_ethernet_address: 192.168.1.50/24
+    race_network_ethernet_gateway: 192.168.1.1
+    race_network_ethernet_dns: [192.168.1.1, 1.1.1.1]
+  tasks:
+    - name: Validate
+      ansible.builtin.include_role:
+        name: race_network
+        tasks_from: validate.yml
+
+- name: Bad settings fail
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Each bad case
+      ansible.builtin.include_tasks: validate_bad_case.yml
+      loop:
+        - { race_network_wifi: [{ ssid: "Track Office", psk: "correct horse battery" }] }
+        - { race_network_ethernet_interface: wlan0 }
+        - { race_network_ethernet_mode: static, race_network_ethernet_address: 192.168.1.50 }
+        - { race_network_ethernet_mode: static, race_network_ethernet_address: 192.168.1.50/24 }
+        - { race_network_ethernet_mode: bridge }
+        - { race_network_ethernet_dns: [dns.example] }
+        - { race_network_hostname: Track_1 }
+      loop_control:
+        loop_var: bad

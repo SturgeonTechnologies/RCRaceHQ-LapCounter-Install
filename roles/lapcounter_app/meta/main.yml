@@ -1,0 +1,17 @@
+---
+galaxy_info:
+  role_name: lapcounter_app
+  author: Sturgeon Technologies LLC
+  description: >-
+    Installs Docker on the race-decoder Pi and runs the lap counter app (lapd +
+    web) from a pinned GHCR image with docker compose.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - trixie
+    - name: Ubuntu
+      versions:
+        - noble
+dependencies: []

@@ -1,0 +1,51 @@
+#!/usr/sbin/nft -f
+# Managed by Ansible (role race_hotspot). Loaded by race-portal-firewall.service.
+# Own table only: never flushes the rest of the ruleset (ufw etc. stay intact).
+{% set lan = race_hotspot_interface %}
+{% set gw = race_hotspot_address %}
+{% set uplinks = race_hotspot_uplinks | map('to_json') | join(', ') %}
+{% set tcp_in = (race_hotspot_input_tcp_ports + [race_hotspot_portal_port]) | map('int') | select('gt', 0) | unique %}
+
+table inet race_portal
+delete table inet race_portal
+
+table inet race_portal {
+	# Hotspot clients that opened http://{{ race_hotspot_hostname }}/ (added by race-portal).
+	set allowed {
+		type ipv4_addr
+		flags timeout
+	}
+
+	# Not let through yet: send every plain-HTTP request to the portal.
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "{{ lan }}" ip daddr != {{ gw }} ip saddr != @allowed tcp dport 80 dnat ip to {{ gw }}:{{ race_hotspot_portal_port }}
+	}
+
+	# The open Wi-Fi only reaches DHCP, DNS and the portal on the Pi. The app is
+	# served through the portal (http://{{ race_hotspot_hostname }}/), so its own port stays closed here.
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname != "{{ lan }}" accept
+		ct state established,related accept
+		meta l4proto icmp accept
+		tcp dport { {{ tcp_in | join(', ') }} } accept
+		udp dport { {{ race_hotspot_input_udp_ports | join(', ') }} } accept
+		drop
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		oifname "{{ lan }}" ct state established,related accept
+		oifname "{{ lan }}" drop
+		iifname "{{ lan }}" ip saddr @allowed oifname { {{ uplinks }} } accept
+		# Fail fast (HTTPS etc.) instead of hanging until the portal is opened.
+		iifname "{{ lan }}" meta l4proto tcp reject with tcp reset
+		iifname "{{ lan }}" reject with icmpx type admin-prohibited
+	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		iifname "{{ lan }}" oifname { {{ uplinks }} } masquerade
+	}
+}

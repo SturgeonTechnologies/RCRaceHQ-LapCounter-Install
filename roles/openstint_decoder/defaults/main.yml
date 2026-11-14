@@ -1,0 +1,83 @@
+---
+# defaults/main.yml — openstint_decoder role
+#
+# Turns a Raspberry Pi (or an arm64/amd64 Ubuntu 24.04+ box) + RTL-SDR into an
+# OpenStint lap-timing decoder: installs the openstint package (upstream apt
+# repo, or built on the host from source), writes /etc/openstint.conf, and
+# drops the `openstint-learn` helper into /usr/local/bin. See README.md.
+#
+# Every var is prefixed openstint_decoder_ so it can't collide with another role.
+
+# ── Upstream apt repo ───────────────────────────────────────────────────
+# This is the repo docs/setup-tutorial-raspberry.md points at. It is UNSIGNED
+# (upstream ships it as [trusted=yes]), so the role pins it: only the
+# `openstint` package may come from it; everything else stays Debian's.
+openstint_decoder_apt_repo_url: "https://repo.lapbeeps.com/apt/"
+openstint_decoder_apt_origin: "repo.lapbeeps.com"
+
+# ── Decoder settings (rendered into /etc/openstint.conf) ────────────────
+# RTL-SDR gain. In direct-sampling mode (RTL-SDR v3 at 5 MHz) the tuner gain
+# is ignored by the hardware, so this mostly matters for a V4 dongle.
+openstint_decoder_gain: 20
+# Learned RC4 files. The package ships this folder root:users 2775 and the
+# unit's ReadWritePaths= points here, so don't move it without editing the unit.
+openstint_decoder_registry_dir: "/var/lib/openstint"
+openstint_decoder_zmq_port: 5556
+# Anything else to pass, e.g. "-d 00000001" to pick a dongle by serial or "-b"
+# for bias-tee power to a powered loop front end.
+openstint_decoder_extra_args: ""
+
+# ── Who can rename/delete .rc4 files without sudo ───────────────────────
+# Added to the `users` group (the registry folder's group).
+openstint_decoder_registry_users:
+  - "{{ ansible_user | default('pi') }}"
+
+# ── Firewall (opt-in) ───────────────────────────────────────────────────
+# The decoder publishes on tcp://*:5556 with no auth. When true, ufw allows
+# that port from this CIDR only (timing laptop / LAN) and keeps SSH open.
+openstint_decoder_manage_ufw: false
+openstint_decoder_zmq_allowed_cidr: "192.168.0.0/24"
+
+# ── Package upkeep ──────────────────────────────────────────────────────
+# "present" leaves an installed decoder alone; "latest" upgrades it. Don't
+# run "latest" on race day. apt method only; source builds upgrade by bumping
+# openstint_decoder_source_version.
+openstint_decoder_package_state: "present"
+
+# ── Install method ──────────────────────────────────────────────────────
+# auto: upstream apt repo on arm64 Debian 13+ (Raspberry Pi OS Trixie),
+#       source build everywhere else (Ubuntu 24.04+, amd64).
+# apt:  force the upstream arm64 .deb (e.g. Ubuntu 25.10+/26.04 on a Pi,
+#       whose libliquid1 is new enough).
+# source: build the .deb on the host from the pinned commit below.
+openstint_decoder_install_method: auto
+
+# ── Source build (install_method: source) ───────────────────────────────
+# Pinned upstream commit. Bump it to upgrade; the role rebuilds only when the
+# installed package's +git<sha7> suffix differs. Don't bump on race day.
+openstint_decoder_source_repo: "https://github.com/zsellera/openstint.git"
+openstint_decoder_source_version: "d60982a6cb09c3456ad29b29b24c2b21a9820522"
+openstint_decoder_source_dir: "/var/cache/openstint-build"
+openstint_decoder_source_build_user: "openstint-build"
+# Upstream's Pi .deb is built with 2; keep it unless upstream changes theirs.
+openstint_decoder_samples_per_symbol: 2
+# Same list as upstream's .github/workflows/build-deb.yml.
+openstint_decoder_source_build_deps:
+  - build-essential
+  - cmake
+  - ninja-build
+  - pkg-config
+  - git
+  - ca-certificates
+  - dpkg-dev
+  - libusb-1.0-0-dev
+  - libzmq3-dev
+  - cppzmq-dev
+  - libliquid-dev
+  - libfec-dev
+# nfpm builds the .deb (upstream's packager). Version + sha256 from
+# https://github.com/goreleaser/nfpm/releases/download/v<version>/checksums.txt
+openstint_decoder_nfpm_version: "2.43.0"
+openstint_decoder_nfpm_sha256:
+  amd64: "4a4402f8f9ea87c669d6a62b333f8e268439974754dd886a01731ecaf9fa6d66"
+  arm64: "2529b6b3fbd107b57064158a183de6a9801f78d5232980cf46419564491fa5c2"

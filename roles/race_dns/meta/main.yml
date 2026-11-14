@@ -1,0 +1,14 @@
+---
+galaxy_info:
+  role_name: race_dns
+  author: Sturgeon Technologies LLC
+  description: >-
+    dnsmasq DHCP + DNS for the lap counter's event LAN: leases on one
+    interface, local event hostname (http://race), upstream forwarding.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - trixie
+dependencies: []

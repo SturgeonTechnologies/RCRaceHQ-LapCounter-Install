@@ -1,0 +1,14 @@
+# Managed by Ansible (role race_hotspot).
+[Unit]
+Description=Lap counter hotspot firewall (captive portal + NAT)
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/race/race-portal.nft
+ExecStop=/usr/sbin/nft delete table inet race_portal
+
+[Install]
+WantedBy=multi-user.target

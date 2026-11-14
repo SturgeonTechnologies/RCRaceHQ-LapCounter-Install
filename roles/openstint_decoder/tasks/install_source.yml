@@ -1,0 +1,123 @@
+---
+# tasks/install_source.yml — build openstint_<version>_<arch>.deb on the host
+# from a pinned upstream commit, with upstream's own packaging/build-deb.sh, and
+# install it. dpkg-shlibdeps computes the dependencies against this release, so
+# the package resolves on Ubuntu (24.04's libliquid1 is 1.6; upstream's arm64
+# .deb wants >= 1.7) and on amd64 (upstream publishes arm64 only).
+#
+# Skipped entirely when the installed openstint already carries the pinned
+# commit (version ends in +git<sha7>). The build runs as an unprivileged user;
+# only the apt steps are root.
+
+- name: Drop the upstream apt repo (this host builds from source)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/openstint.list
+    - /etc/apt/preferences.d/openstint.pref
+
+- name: Install build dependencies and the learn helper's dependency
+  ansible.builtin.apt:
+    name: "{{ openstint_decoder_source_build_deps + ['python3-zmq'] }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Read the installed openstint version
+  ansible.builtin.command: dpkg-query -W -f=${Version} openstint
+  register: openstint_decoder_installed
+  changed_when: false
+  failed_when: false
+
+- name: Build and install the pinned commit
+  when: >-
+    openstint_decoder_installed.rc != 0
+    or not openstint_decoder_installed.stdout.endswith('+git' ~ openstint_decoder_source_version[:7])
+  vars:
+    openstint_decoder_deb_arch: "{{ {'aarch64': 'arm64', 'x86_64': 'amd64'}[ansible_facts['architecture']] }}"
+    openstint_decoder_src: "{{ openstint_decoder_source_dir }}/src"
+    openstint_decoder_nfpm_deb: "nfpm_{{ openstint_decoder_nfpm_version }}_{{ openstint_decoder_deb_arch }}.deb"
+  block:
+    - name: Create the build user
+      ansible.builtin.user:
+        name: "{{ openstint_decoder_source_build_user }}"
+        system: true
+        home: "{{ openstint_decoder_source_dir }}"
+        create_home: true
+        shell: /usr/sbin/nologin
+
+    - name: Download nfpm (upstream's packager), checksum-pinned
+      ansible.builtin.get_url:
+        url: "https://github.com/goreleaser/nfpm/releases/download/v{{ openstint_decoder_nfpm_version }}/{{ openstint_decoder_nfpm_deb }}"
+        dest: "/var/cache/apt/archives/{{ openstint_decoder_nfpm_deb }}"
+        checksum: "sha256:{{ openstint_decoder_nfpm_sha256[openstint_decoder_deb_arch] }}"
+        mode: "0644"
+
+    - name: Install nfpm
+      ansible.builtin.apt:
+        deb: "/var/cache/apt/archives/{{ openstint_decoder_nfpm_deb }}"
+
+    # Pipelining avoids the temp-file ACL dance when becoming an unprivileged user.
+    - name: Build as the unprivileged user
+      become: true
+      become_user: "{{ openstint_decoder_source_build_user }}"
+      vars:
+        ansible_pipelining: true
+      block:
+        - name: Check out the pinned upstream commit
+          ansible.builtin.git:
+            repo: "{{ openstint_decoder_source_repo }}"
+            dest: "{{ openstint_decoder_src }}"
+            version: "{{ openstint_decoder_source_version }}"
+            force: true
+
+        # The git module doesn't report commit dates.
+        - name: Read the commit date (the YYMMDD in the package version)  # noqa: command-instead-of-module
+          ansible.builtin.command: git -C {{ openstint_decoder_src }} show -s --format=%cd --date=format:%y%m%d HEAD
+          register: openstint_decoder_commit_date
+          changed_when: false
+
+        # Fresh build dir each time: CMake caches FetchContent results, and a
+        # stale cache from an older commit is the one thing that could mix.
+        - name: Remove any previous build tree
+          ansible.builtin.file:
+            path: "{{ openstint_decoder_src }}/build"
+            state: absent
+
+        - name: Configure (CMake also fetches the pinned rtl-sdr/hackrf drivers)
+          ansible.builtin.command:
+            argv:
+              - cmake
+              - -G
+              - Ninja
+              - -DCMAKE_BUILD_TYPE=Release
+              - "-DSAMPLES_PER_SYMBOL={{ openstint_decoder_samples_per_symbol }}"
+              - -B
+              - build
+              - .
+            chdir: "{{ openstint_decoder_src }}"
+          changed_when: true
+
+        - name: Compile (several minutes on a Pi 4)
+          ansible.builtin.command:
+            argv: [ninja, -C, build]
+            chdir: "{{ openstint_decoder_src }}"
+          changed_when: true
+
+        - name: Package with upstream's build-deb.sh
+          ansible.builtin.command:
+            argv: [packaging/build-deb.sh]
+            chdir: "{{ openstint_decoder_src }}"
+          environment:
+            VERSION: "0.{{ openstint_decoder_commit_date.stdout }}.0+git{{ openstint_decoder_source_version[:7] }}"
+            OUT_DIR: dist
+          register: openstint_decoder_build
+          changed_when: true
+
+    - name: Install the built package
+      ansible.builtin.apt:
+        deb: >-
+          {{ openstint_decoder_src }}/dist/openstint_0.{{ openstint_decoder_commit_date.stdout }}.0+git{{
+          openstint_decoder_source_version[:7] }}_{{ openstint_decoder_deb_arch }}.deb
+      notify: Restart openstint

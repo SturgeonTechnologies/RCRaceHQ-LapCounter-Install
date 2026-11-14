@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""race-portal: captive portal for the lap counter hotspot.
+
+Hotspot clients that haven't been let through have every plain-HTTP request
+DNAT'd here by the race_portal nftables table. This server:
+
+  * answers any host other than the event hostname with a 302 to
+    http://race/ (that is what makes phones pop the "sign in to network" sheet
+    from their connectivity probes), and
+  * on a request for the event hostname itself, adds the client's IPv4 address
+    to the nftables `allowed` set (with a timeout) and serves the lap counter
+    app by proxying to 127.0.0.1:<app port>. So the event address is just
+    http://race/ (check-in at http://race/checkin, kiosk at http://race/kiosk),
+    with no port to explain. From then on the client's other traffic is
+    forwarded and NATed out the uplink.
+
+With race_hotspot_web_on_eth0 it also listens on the wired side and proxies the
+app there too (http://<pi>.local/): no nft grant, since wired clients aren't
+routed through the Pi. The app itself still answers on :<app port> for the wired
+side; on the hotspot that port is closed, so everything goes through here.
+
+The real client address goes to the app in X-Forwarded-For (any the client sent
+is dropped); the app trusts it only from 127.0.0.1.
+
+If the app isn't answering (not deployed yet, or restarting), both sides get a
+small fallback page instead of an error.
+
+Stdlib only. Runs unprivileged with CAP_NET_ADMIN (for `nft`) and
+CAP_NET_BIND_SERVICE (port 80); see race-portal.service.
+
+"""
+
+from __future__ import annotations
+
+import html
+import http.client
+import ipaddress
+import logging
+import os
+
+import socket
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+LOG = logging.getLogger("race-portal")
+
+
+@dataclass(frozen=True)
+class Config:
+    listen_addr: str
+    listen_port: int
+    gateway: ipaddress.IPv4Address
+    network: ipaddress.IPv4Network
+    hostname: str
+    hostnames: frozenset[str]
+    nft_table: str
+    nft_set: str
+    timeout: str
+    title: str
+    app_port: int  # 0 = no app, always serve the fallback page
+
+    @classmethod
+    def from_env(cls, env: dict[str, str]) -> "Config":
+        gateway = ipaddress.IPv4Address(env.get("PORTAL_GATEWAY", "10.77.0.1"))
+        prefix = int(env.get("PORTAL_PREFIX", "24"))
+        hostname = env.get("PORTAL_HOSTNAME", "race").lower()
+        domain = env.get("PORTAL_DOMAIN", "lan").lower()
+        return cls(
+            listen_addr=env.get("PORTAL_LISTEN", str(gateway)),
+            listen_port=int(env.get("PORTAL_PORT", "80")),
+            gateway=gateway,
+            network=ipaddress.IPv4Network(f"{gateway}/{prefix}", strict=False),
+            hostname=hostname,
+            hostnames=frozenset({hostname, f"{hostname}.{domain}", str(gateway)}),
+            nft_table=env.get("PORTAL_NFT_TABLE", "race_portal"),
+            nft_set=env.get("PORTAL_NFT_SET", "allowed"),
+            timeout=env.get("PORTAL_TIMEOUT", "12h"),
+            title=env.get("PORTAL_TITLE", "RC Race Event"),
+            app_port=int(env.get("PORTAL_APP_PORT", "0")),
+        )
+
+    @property
+    def portal_url(self) -> str:
+        return f"http://{self.hostname}/"
+
+
+# Hop-by-hop headers (RFC 9110 7.6.1) never cross the proxy, and the client's
+# own forwarding headers are dropped so it can't pick the address the app sees.
+HOP_BY_HOP = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "proxy-connection", "te", "trailer", "trailers", "transfer-encoding", "upgrade",
+})
+CLIENT_FORWARDING = frozenset({
+    "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "forwarded",
+})
+MAX_BODY = 1024 * 1024        # the app's own cap is 64 KiB
+UPSTREAM_TIMEOUT = 90         # > the app's 55 s live stream
+GRANT_REFRESH = 600           # re-run nft for a client at most every 10 min
+
+
+def upstream_headers(headers, client: str) -> list[tuple[str, str]]:
+    """Request headers to send the app: hop-by-hop and client forwarding headers
+    dropped, X-Forwarded-For set to the address we actually saw."""
+    out = [(k, v) for k, v in headers.items()
+           if k.lower() not in HOP_BY_HOP and k.lower() not in CLIENT_FORWARDING]
+    out.append(("X-Forwarded-For", client))
+    out.append(("X-Forwarded-Proto", "http"))
+    host = headers.get("Host")
+    if host:
+        out.append(("X-Forwarded-Host", host))
+    return out
+
+
+def downstream_headers(headers) -> list[tuple[str, str]]:
+    """Response headers to pass back (repeats such as Set-Cookie kept)."""
+    return [(k, v) for k, v in headers if k.lower() not in HOP_BY_HOP]
+
+
+def app_is_up(cfg: Config, timeout: float = 0.5) -> bool:
+    """True if something accepts connections on the app port (host networking)."""
+    if not cfg.app_port:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", cfg.app_port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def request_host(header: str | None) -> str:
+    """Host header -> bare lowercase hostname (port and trailing dot removed)."""
+    if not header:
+        return ""
+    host = header.strip().lower()
+    if host.startswith("["):  # IPv6 literal; never ours
+        return host
+    return host.rsplit(":", 1)[0].rstrip(".")
+
+
+def client_to_allow(cfg: Config, client: str) -> ipaddress.IPv4Address | None:
+    """The client's address if it is a hotspot client we may let through."""
+    try:
+        addr = ipaddress.IPv4Address(client)
+    except ValueError:
+        return None
+    if addr not in cfg.network or addr in (cfg.gateway, cfg.network.network_address,
+                                           cfg.network.broadcast_address):
+        return None
+    return addr
+
+
+def nft_add_command(cfg: Config, addr: ipaddress.IPv4Address) -> list[str]:
+    # addr is a validated IPv4Address and timeout comes from our own unit
+    # file, so nothing user-controlled reaches nft's parser.
+    return ["nft", "add", "element", "inet", cfg.nft_table, cfg.nft_set,
+            f"{{ {addr} timeout {cfg.timeout} }}"]
+
+
+class GrantCache:
+    """Every page, script and live-stream request for http://race/ comes through
+    the portal now, so don't run nft for each one: once per client per
+    GRANT_REFRESH is plenty against a 12 h timeout."""
+
+    def __init__(self, refresh: float = GRANT_REFRESH, clock=time.monotonic):
+        self.refresh = refresh
+        self.clock = clock
+        self._last: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def fresh(self, client: str) -> bool:
+        with self._lock:
+            last = self._last.get(client)
+            return last is not None and self.clock() - last < self.refresh
+
+    def mark(self, client: str) -> None:
+        with self._lock:
+            self._last[client] = self.clock()
+
+
+def grant_access(cfg: Config, client: str, run=subprocess.run) -> bool:
+    addr = client_to_allow(cfg, client)
+    if addr is None:
+        return False
+    result = run(nft_add_command(cfg, addr), capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        LOG.error("nft add %s failed: %s", addr, (result.stderr or "").strip())
+        return False
+    LOG.info("allowed %s for %s", addr, cfg.timeout)
+    return True
+
+
+STATUS_TEXT = {
+    "online": "You're connected. Internet access is on for this device.",
+    "offline": "You're on the event network, but internet access couldn't be turned on.",
+    "wired": "You're on the track network.",
+}
+
+
+def landing_page(cfg: Config, status: str) -> bytes:
+    title = html.escape(cfg.title)
+    text = STATUS_TEXT[status]
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem}}</style>
+</head><body>
+<h1>{title}</h1>
+<p>{html.escape(text, quote=False)}</p>
+<p>The event page isn't running yet. Try again in a minute at <strong>{html.escape(cfg.portal_url)}</strong>.</p>
+</body></html>
+""".encode()
+
+
+def on_hotspot(cfg: Config, client: str) -> bool:
+    try:
+        return ipaddress.IPv4Address(client) in cfg.network
+    except ValueError:
+        return False
+
+
+def decide(cfg: Config, host_header: str | None, client: str | None = None) -> str:
+    """'wired' for clients off the hotspot subnet; on the hotspot, 'portal' for
+    the event hostname and 'redirect' for anything else."""
+    if client is not None and not on_hotspot(cfg, client):
+        return "wired"
+    return "portal" if request_host(host_header) in cfg.hostnames else "redirect"
+
+
+def make_handler(cfg: Config, grants: GrantCache | None = None):
+    grants = grants or GrantCache()
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "race-portal"
+        sys_version = ""
+        timeout = 120  # an idle or stalled client doesn't hold a thread forever
+
+        def _send(self, status: int, body: bytes = b"", headers: dict[str, str] | None = None):
+            self.send_response(status)
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _grant(self, client: str) -> bool:
+            if grants.fresh(client):
+                return True
+            ok = grant_access(cfg, client)
+            if ok:
+                grants.mark(client)
+            return ok
+
+        def _proxy(self, client: str) -> bool:
+            """Serve this request from the app. False if the app can't be reached
+            (caller shows the fallback page)."""
+            if not cfg.app_port:
+                return False
+            if not self.path.startswith("/"):
+                self._send(400)
+                return True
+            if self.headers.get("Transfer-Encoding"):
+                self._send(411)
+                return True
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_BODY:
+                self._send(413)
+                return True
+            body = self.rfile.read(length) if length else None
+
+            conn = http.client.HTTPConnection("127.0.0.1", cfg.app_port, timeout=UPSTREAM_TIMEOUT)
+            try:
+                conn.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
+                for key, value in upstream_headers(self.headers, client):
+                    conn.putheader(key, value)
+                if body is not None:
+                    conn.putheader("Content-Length", str(len(body)))
+                conn.endheaders(body)
+                resp = conn.getresponse()
+            except OSError as err:
+                LOG.warning("app unreachable on :%d: %s", cfg.app_port, err)
+                conn.close()
+                return False
+
+            try:
+                # HTTP/1.0 and one response per connection: the body (including the
+                # live Server-Sent Events stream) runs until the app closes it.
+                self.send_response(resp.status, resp.reason)
+                for key, value in downstream_headers(resp.getheaders()):
+                    self.send_header(key, value)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if self.command != "HEAD":
+                    while chunk := resp.read1(65536):
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+            except OSError:
+                pass  # client went away (closed tab, idle phone); nothing to tell it
+            finally:
+                conn.close()
+                self.close_connection = True
+            return True
+
+        def _handle(self):
+            client = self.client_address[0]
+            action = decide(cfg, self.headers.get("Host"), client)
+            if action == "redirect":
+                code = 302 if self.command in ("GET", "HEAD") else 303
+                self._send(code, headers={"Location": cfg.portal_url})
+                return
+            if action == "wired":
+                status = "wired"
+            else:
+                status = "online" if self._grant(client) else "offline"
+            if self._proxy(client):
+                return
+            self._send(200, landing_page(cfg, status),
+                       {"Content-Type": "text/html; charset=utf-8"})
+
+        do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = _handle
+
+        def log_message(self, fmt, *args):
+            LOG.debug("%s %s", self.client_address[0], fmt % args)
+
+    return Handler
+
+
+def main() -> int:
+    logging.basicConfig(level=os.environ.get("PORTAL_LOG_LEVEL", "INFO"),
+                        format="%(levelname)s %(message)s", stream=sys.stdout)
+    cfg = Config.from_env(dict(os.environ))
+    server = ThreadingHTTPServer((cfg.listen_addr, cfg.listen_port), make_handler(cfg))
+    server.daemon_threads = True
+    LOG.info("listening on %s:%d, portal %s", cfg.listen_addr, cfg.listen_port, cfg.portal_url)
+    server.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

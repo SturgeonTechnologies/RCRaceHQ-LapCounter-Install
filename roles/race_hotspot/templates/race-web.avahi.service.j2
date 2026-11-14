@@ -1,0 +1,11 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!-- Managed by Ansible (role race_hotspot): race_hotspot_web_on_eth0. -->
+<service-group>
+  <name replace-wildcards="yes">{{ race_hotspot_portal_title | replace('&', '&amp;') | replace('<', '&lt;') }} (%h)</name>
+  <service>
+    <type>_http._tcp</type>
+    <port>{{ race_hotspot_portal_port }}</port>
+    <txt-record>path=/</txt-record>
+  </service>
+</service-group>

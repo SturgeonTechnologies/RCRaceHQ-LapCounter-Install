@@ -1,0 +1,42 @@
+---
+# tasks/validate.yml — race_network role. No host changes; also run on
+# localhost by tests/validate_localhost.yml.
+
+- name: Validate the wired settings
+  ansible.builtin.assert:
+    that:
+      - race_network_ethernet_mode in ['unmanaged', 'dhcp', 'static']
+      - race_network_ethernet_mode != 'static'
+        or (race_network_ethernet_address is match('^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$'))
+      - race_network_ethernet_mode != 'static'
+        or (race_network_ethernet_gateway is match('^\d{1,3}(\.\d{1,3}){3}$'))
+      - race_network_ethernet_dns | select('match', '^\d{1,3}(\.\d{1,3}){3}$') | list | length
+        == race_network_ethernet_dns | length
+      - race_network_ethernet_interface != race_network_hotspot_interface
+    fail_msg: >-
+      race_network_ethernet_mode must be unmanaged, dhcp or static. static
+      needs race_network_ethernet_address as CIDR (192.168.1.50/24) and
+      race_network_ethernet_gateway (192.168.1.1). DNS servers must be IPv4
+      addresses. The wired interface can't be the hotspot radio
+      ({{ race_network_hotspot_interface }}).
+
+- name: Refuse the removed client Wi-Fi setting
+  ansible.builtin.assert:
+    that:
+      - race_network_wifi is not defined or race_network_wifi | length == 0
+    fail_msg: >-
+      race_network_wifi is set, but the Pi no longer joins Wi-Fi networks as a
+      client: its internet is the wired port only. Remove race_network_wifi
+      (it's probably in vault.yml). Wi-Fi settings are the event hotspot's:
+      race_hotspot_ssid / race_hotspot_passphrase.
+    quiet: true
+
+- name: Validate the hostname
+  ansible.builtin.assert:
+    that:
+      - race_network_hostname | length == 0
+        or race_network_hostname is match('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+    fail_msg: >-
+      race_network_hostname "{{ race_network_hostname }}" must be lowercase
+      letters, digits and dashes, 1-63 characters, not starting or ending
+      with a dash.

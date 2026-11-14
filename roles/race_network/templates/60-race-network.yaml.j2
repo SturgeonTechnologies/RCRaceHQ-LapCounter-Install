@@ -1,0 +1,26 @@
+# Managed by Ansible (role race_network). Merged over 50-cloud-init.yaml:
+# the same ethernets.{{ race_network_ethernet_interface }} key, so these values win.
+network:
+  version: 2
+  ethernets:
+    {{ race_network_ethernet_interface }}:
+{% if race_network_ethernet_mode == 'static' %}
+      dhcp4: false
+      addresses:
+        - {{ race_network_ethernet_address }}
+      routes:
+        - to: default
+          via: {{ race_network_ethernet_gateway }}
+          metric: {{ race_network_ethernet_metric | int }}
+{% else %}
+      dhcp4: true
+      dhcp4-overrides:
+        route-metric: {{ race_network_ethernet_metric | int }}
+{% endif %}
+{% if race_network_ethernet_dns | length > 0 %}
+      nameservers:
+        addresses:
+{% for dns in race_network_ethernet_dns %}
+          - {{ dns }}
+{% endfor %}
+{% endif %}

@@ -1,0 +1,20 @@
+---
+# provision_race_decoder.yml — turn a Raspberry Pi + RTL-SDR into an
+# OpenStint RC lap-timing decoder, with the openstint-learn helper for RC4
+# transponders. Docs: docs/provision_race_decoder.md
+#
+# Not a localhost play — this targets a real Pi over SSH. Pass the dedicated
+# inventory: -i inventory/race_decoders.yml
+- name: Provision OpenStint race decoder
+  hosts: race_decoders
+  become: true
+  gather_facts: true # needs architecture / distribution for the asserts
+  roles:
+    - openstint_decoder
+    # Hostname, eth0 DHCP (default) or static. eth0 is the Pi's only uplink.
+    # docs/configure_network.md
+    - race_network
+    # Event Wi-Fi on the built-in radio (always). Captive portal at
+    # http://race lets devices out via eth0 and sends them to the app
+    # (check-in, live/race status, kiosk). Pulls in race_dns.
+    - role: race_hotspot

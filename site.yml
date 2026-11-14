@@ -1,0 +1,7 @@
+---
+# site.yml — a new Pi end to end: provision the decoder (+ hotspot), then
+# deploy the app. Each step is also its own playbook.
+- name: Provision
+  ansible.builtin.import_playbook: provision_race_decoder.yml
+- name: Deploy the app
+  ansible.builtin.import_playbook: deploy_lapcounter_app.yml

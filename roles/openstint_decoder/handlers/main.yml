@@ -1,0 +1,7 @@
+---
+# handlers/main.yml — openstint_decoder role
+
+- name: Restart openstint
+  ansible.builtin.systemd_service:
+    name: openstint.service
+    state: restarted

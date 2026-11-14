@@ -1,0 +1,364 @@
+---
+# tasks/main.yml — race_hotspot role
+# (race_dns runs first via meta) Validate -> Wi-Fi country -> NetworkManager AP
+# profile -> forwarding -> nftables portal/NAT -> portal service -> ufw -> check.
+
+- name: Validate settings
+  ansible.builtin.assert:
+    that:
+      - race_hotspot_enabled | default(true) | bool
+      - race_hotspot_uplinks | length > 0
+      - race_hotspot_interface not in race_hotspot_uplinks
+      - race_hotspot_passphrase | length == 0 or (8 <= (race_hotspot_passphrase | length) <= 63)
+      - race_hotspot_country | length == 2
+      - race_hotspot_web_eth0_interface != race_hotspot_interface
+    fail_msg: >-
+      wlan0 is always the event AP. Remove race_hotspot_enabled: false (that
+      skip is gone). Also need at least one uplink that isn't the hotspot
+      interface, a passphrase that is empty (open) or 8-63 characters, a
+      2-letter Wi-Fi country, and a wired interface for
+      race_hotspot_web_on_eth0 that isn't the hotspot.
+
+- name: Refuse to run if we're managing the Pi over the hotspot interface
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['default_ipv4']['interface'] | default('') != race_hotspot_interface
+    fail_msg: >-
+      This Pi's default route is on {{ race_hotspot_interface }}. Turning it into
+      the access point would drop this SSH session and the uplink. Connect the
+      Pi by Ethernet first, then rerun.
+
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+
+# Raspberry Pi OS ships NetworkManager. Ubuntu Server doesn't: install it
+# alongside systemd-networkd. Ubuntu's package only manages Wi-Fi by default
+# (usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf), so eth0
+# stays on networkd and the SSH session survives. Netplan must not also
+# configure the hotspot radio, or networkd and NetworkManager fight over it.
+- name: Install NetworkManager next to networkd (Ubuntu)
+  when: ansible_facts['distribution'] == 'Ubuntu'
+  block:
+    - name: Read the netplan Wi-Fi config
+      ansible.builtin.command: netplan get wifis
+      register: race_hotspot_netplan_wifis
+      changed_when: false
+
+    - name: Refuse if netplan already configures the hotspot radio
+      ansible.builtin.assert:
+        that:
+          - race_hotspot_interface not in (race_hotspot_netplan_wifis.stdout | from_yaml | default({}, true))
+        fail_msg: >-
+          netplan configures {{ race_hotspot_interface }} under `wifis:` (see
+          /etc/netplan/). Remove that block and run `sudo netplan apply`, so
+          NetworkManager can turn the radio into the access point.
+
+    - name: Install NetworkManager
+      ansible.builtin.apt:
+        name: network-manager
+        state: present
+
+    - name: Enable and start NetworkManager
+      ansible.builtin.systemd_service:
+        name: NetworkManager.service
+        enabled: true
+        state: started
+
+- name: Check NetworkManager manages the network
+  ansible.builtin.command: nmcli -t -f RUNNING general
+  register: race_hotspot_nm
+  changed_when: false
+  failed_when: race_hotspot_nm.rc != 0 or race_hotspot_nm.stdout != 'running'
+
+# ── Radio ───────────────────────────────────────────────────────────────
+
+# Raspberry Pi OS keeps the radio soft-blocked until a country is set, and
+# raspi-config is how it stores one. Ubuntu has no raspi-config: set the
+# regulatory domain on cfg80211 instead (persisted via modprobe) and unblock.
+
+- name: Look for raspi-config
+  ansible.builtin.stat:
+    path: /usr/bin/raspi-config
+  register: race_hotspot_raspi_config
+
+- name: Read the Wi-Fi country (raspi-config)
+  ansible.builtin.command: raspi-config nonint get_wifi_country
+  register: race_hotspot_country_now
+  changed_when: false
+  failed_when: false
+  when: race_hotspot_raspi_config.stat.exists
+
+- name: Set the Wi-Fi country (raspi-config, unblocks the radio)
+  ansible.builtin.command: raspi-config nonint do_wifi_country {{ race_hotspot_country }}
+  when:
+    - race_hotspot_raspi_config.stat.exists
+    - race_hotspot_country_now.stdout | trim != race_hotspot_country
+  changed_when: true
+
+- name: Set the Wi-Fi country without raspi-config
+  when: not race_hotspot_raspi_config.stat.exists
+  block:
+    - name: Install iw and rfkill
+      ansible.builtin.apt:
+        name: [iw, rfkill]
+        state: present
+
+    - name: Persist the regulatory domain for cfg80211
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/race-hotspot-regdom.conf
+        content: "options cfg80211 ieee80211_regdom={{ race_hotspot_country }}\n"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Read the regulatory domain
+      ansible.builtin.command: iw reg get
+      register: race_hotspot_reg_now
+      changed_when: false
+
+    - name: Set the regulatory domain now
+      ansible.builtin.command: iw reg set {{ race_hotspot_country }}
+      when: ("country " ~ race_hotspot_country ~ ":") not in race_hotspot_reg_now.stdout
+      changed_when: true
+
+    - name: Read the Wi-Fi rfkill state
+      ansible.builtin.command: rfkill list wifi
+      register: race_hotspot_rfkill
+      changed_when: false
+
+    - name: Unblock the Wi-Fi radio
+      ansible.builtin.command: rfkill unblock wifi
+      when: "'Soft blocked: yes' in race_hotspot_rfkill.stdout"
+      changed_when: true
+
+- name: Create the hotspot connection profile
+  community.general.nmcli:
+    conn_name: race-hotspot
+    type: wifi
+    ifname: "{{ race_hotspot_interface }}"
+    ssid: "{{ race_hotspot_ssid }}"
+    wifi:
+      mode: ap
+      band: "{{ race_hotspot_band }}"
+      channel: "{{ race_hotspot_channel }}"
+      powersave: 2
+    wifi_sec: "{{ {'key-mgmt': 'wpa-psk', 'proto': ['rsn'], 'psk': race_hotspot_passphrase} if race_hotspot_passphrase else omit }}"
+    # manual, not "shared": race_dns runs DHCP/DNS, not NetworkManager's dnsmasq
+    method4: manual
+    ip4: "{{ race_hotspot_address }}/{{ race_hotspot_prefix }}"
+    method6: disabled
+    autoconnect: true
+    # Beat any client profile Raspberry Pi Imager left on the same radio.
+    autoconnect_priority: 100
+    state: present
+  no_log: "{{ race_hotspot_passphrase | length > 0 }}"
+  notify: Bring up the hotspot
+
+# NetworkManager can leave an AP profile on "shared", which starts its own
+# dnsmasq on the hotspot address and collides with race_dns ("Address already
+# in use" -> ip-config-unavailable). Pin it to manual every run.
+- name: Read the hotspot IPv4 method
+  ansible.builtin.command: nmcli -g ipv4.method connection show race-hotspot
+  register: race_hotspot_ipv4_method
+  changed_when: false
+
+- name: Force manual IPv4 on the hotspot profile
+  ansible.builtin.command: >-
+    nmcli connection modify race-hotspot
+    ipv4.method manual
+    ipv4.addresses {{ race_hotspot_address }}/{{ race_hotspot_prefix }}
+  when: race_hotspot_ipv4_method.stdout | trim != 'manual'
+  changed_when: true
+  notify: Bring up the hotspot
+
+# ── Routing + firewall ──────────────────────────────────────────────────
+
+- name: Enable IPv4 forwarding
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-race-hotspot.conf
+    content: |
+      # Managed by Ansible (role race_hotspot): hotspot clients -> uplink NAT.
+      net.ipv4.ip_forward = 1
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Apply sysctl
+
+- name: Create /etc/race
+  ansible.builtin.file:
+    path: /etc/race
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Render the portal/NAT ruleset
+  ansible.builtin.template:
+    src: race-portal.nft.j2
+    dest: /etc/race/race-portal.nft
+    owner: root
+    group: root
+    mode: "0644"
+    validate: nft -c -f %s
+  notify: Restart race-portal-firewall
+
+- name: Install the portal and firewall units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: /etc/systemd/system/{{ item }}
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - race-portal-firewall.service
+    - race-portal.service
+  notify:
+    - Reload systemd
+    - Restart race-portal-firewall
+    - Restart race-portal
+
+- name: Install race-portal
+  ansible.builtin.copy:
+    src: race-portal
+    dest: /usr/local/sbin/race-portal
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart race-portal
+
+- name: Apply unit and ruleset changes before enabling
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start the firewall and portal
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - race-portal-firewall.service
+    - race-portal.service
+
+# ── Wired side: mDNS name for the event page (race_hotspot_web_on_eth0) ─────────
+
+- name: Install avahi (http://<hostname>.local/ on the wired side)
+  ansible.builtin.apt:
+    name: avahi-daemon
+    state: present
+  when: race_hotspot_web_on_eth0 | bool
+
+- name: Publish the event page over mDNS
+  ansible.builtin.template:
+    src: race-web.avahi.service.j2
+    dest: /etc/avahi/services/race-web.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: race_hotspot_web_on_eth0 | bool
+
+- name: Stop publishing the event page over mDNS
+  ansible.builtin.file:
+    path: /etc/avahi/services/race-web.service
+    state: absent
+  when: not race_hotspot_web_on_eth0 | bool
+
+- name: Enable avahi
+  ansible.builtin.systemd_service:
+    name: avahi-daemon.service
+    enabled: true
+    state: started
+  when: race_hotspot_web_on_eth0 | bool
+
+# ── ufw (only when the decoder role turned it on) ───────────────────────
+
+- name: Allow DNS/portal (TCP) on the hotspot through ufw
+  community.general.ufw:
+    rule: allow
+    direction: in
+    interface: "{{ race_hotspot_interface }}"
+    port: "{{ item | string }}"
+    proto: tcp
+  loop: >-
+    {{ (race_hotspot_input_tcp_ports + [race_hotspot_portal_port])
+       | map('int') | select('gt', 0) | unique }}
+  when: race_hotspot_manage_ufw | bool
+
+# Earlier versions opened the app port on the hotspot; it's served through the
+# portal now.
+- name: Close the app port on the hotspot through ufw
+  community.general.ufw:
+    rule: allow
+    direction: in
+    interface: "{{ race_hotspot_interface }}"
+    port: "{{ race_hotspot_app_port | string }}"
+    proto: tcp
+    delete: true
+  when:
+    - race_hotspot_manage_ufw | bool
+    - race_hotspot_app_port | int > 0
+    - race_hotspot_app_port | int != race_hotspot_portal_port | int
+
+- name: Allow DHCP/DNS (UDP) on the hotspot through ufw
+  community.general.ufw:
+    rule: allow
+    direction: in
+    interface: "{{ race_hotspot_interface }}"
+    port: "{{ item | string }}"
+    proto: udp
+  loop: "{{ race_hotspot_input_udp_ports }}"
+  when: race_hotspot_manage_ufw | bool
+
+- name: Let hotspot traffic be routed to the uplinks through ufw
+  community.general.ufw:
+    rule: allow
+    route: true
+    interface_in: "{{ race_hotspot_interface }}"
+    interface_out: "{{ item }}"
+  loop: "{{ race_hotspot_uplinks }}"
+  when: race_hotspot_manage_ufw | bool
+
+- name: Allow the event page on the wired side through ufw
+  community.general.ufw:
+    rule: allow
+    direction: in
+    interface: "{{ race_hotspot_web_eth0_interface }}"
+    from_ip: "{{ race_hotspot_web_eth0_allowed_cidr }}"
+    port: "{{ item | string }}"
+    proto: tcp
+    delete: "{{ not race_hotspot_web_on_eth0 | bool }}"
+  loop: "{{ [race_hotspot_portal_port, race_hotspot_app_port] | map('int') | select('gt', 0) | unique }}"
+  when: race_hotspot_manage_ufw | bool
+
+- name: Allow mDNS on the wired side through ufw
+  community.general.ufw:
+    rule: allow
+    direction: in
+    interface: "{{ race_hotspot_web_eth0_interface }}"
+    port: "5353"
+    proto: udp
+    delete: "{{ not race_hotspot_web_on_eth0 | bool }}"
+  when: race_hotspot_manage_ufw | bool
+
+# ── Check ───────────────────────────────────────────────────────────────
+
+- name: Read hotspot state
+  ansible.builtin.command: nmcli -t -f GENERAL.STATE connection show race-hotspot
+  register: race_hotspot_state
+  changed_when: false
+  failed_when: false
+
+- name: Summary
+  ansible.builtin.debug:
+    msg:
+      - "SSID:    {{ race_hotspot_ssid }} ({{ 'WPA2' if race_hotspot_passphrase else 'open' }}), {{ race_hotspot_state.stdout | default('state unknown') }}"
+      - >-
+        Portal:  http://{{ race_hotspot_hostname }}/  ({{ race_hotspot_address }})
+        {{- (' serves the app (127.0.0.1:' ~ race_hotspot_app_port ~ '): /checkin, /kiosk')
+            if race_hotspot_app_port | int > 0 else '' }}
+      - >-
+        Wired:   {{ ('http://' ~ ansible_facts['hostname'] ~ '.local/ on ' ~ race_hotspot_web_eth0_interface)
+        if race_hotspot_web_on_eth0 | bool else 'off (race_hotspot_web_on_eth0: false)' }}
+      - "Uplinks: {{ race_hotspot_uplinks | join(', ') }}  (let through for {{ race_hotspot_access_timeout }})"
+      - "Allowed: sudo nft list set inet race_portal allowed"
+      - "Logs:    journalctl -u race-portal -f"

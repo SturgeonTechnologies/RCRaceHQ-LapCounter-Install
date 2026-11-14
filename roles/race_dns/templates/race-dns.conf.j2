@@ -1,0 +1,24 @@
+# Managed by Ansible (role race_dns). Local edits are overwritten.
+
+# Only serve the event LAN. bind-dynamic copes with the interface coming up
+# after dnsmasq; except-interface keeps it off loopback so the Pi's own
+# resolver config (NetworkManager) is untouched.
+interface={{ race_dns_interface }}
+except-interface=lo
+bind-dynamic
+
+# DNS
+domain-needed
+bogus-priv
+cache-size={{ race_dns_cache_size }}
+domain={{ race_dns_domain }}
+local=/{{ race_dns_domain }}/
+address=/{{ race_dns_hostname }}/{{ race_dns_address }}
+address=/{{ race_dns_hostname }}.{{ race_dns_domain }}/{{ race_dns_address }}
+
+# DHCP
+dhcp-authoritative
+dhcp-range={{ race_dns_interface }},{{ race_dns_dhcp_start }},{{ race_dns_dhcp_end }},{{ race_dns_netmask }},{{ race_dns_lease_time }}
+dhcp-option={{ race_dns_interface }},option:router,{{ race_dns_address }}
+dhcp-option={{ race_dns_interface }},option:dns-server,{{ race_dns_address }}
+dhcp-option={{ race_dns_interface }},option:domain-search,{{ race_dns_domain }}

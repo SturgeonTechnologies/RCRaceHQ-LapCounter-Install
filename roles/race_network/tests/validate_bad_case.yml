@@ -1,0 +1,24 @@
+---
+- name: Validate {{ bad | to_json }}
+  block:
+    - name: Run the validation
+      ansible.builtin.include_role:
+        name: race_network
+        tasks_from: validate.yml
+      vars:
+        race_network_wifi: "{{ bad.race_network_wifi | default([]) }}"
+        race_network_ethernet_interface: "{{ bad.race_network_ethernet_interface | default('eth0') }}"
+        race_network_ethernet_mode: "{{ bad.race_network_ethernet_mode | default('dhcp') }}"
+        race_network_ethernet_address: "{{ bad.race_network_ethernet_address | default('') }}"
+        race_network_ethernet_gateway: "{{ bad.race_network_ethernet_gateway | default('') }}"
+        race_network_ethernet_dns: "{{ bad.race_network_ethernet_dns | default([]) }}"
+        race_network_hostname: "{{ bad.race_network_hostname | default('') }}"
+
+    - name: It should not have passed
+      ansible.builtin.fail:
+        msg: "Validation accepted bad settings: {{ bad | to_json }}"
+  rescue:
+    - name: Fail if the bad case got through
+      ansible.builtin.fail:
+        msg: "{{ ansible_failed_result.msg }}"
+      when: "'Validation accepted bad settings' in (ansible_failed_result.msg | default(''))"
