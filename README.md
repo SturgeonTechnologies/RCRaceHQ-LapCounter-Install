@@ -40,6 +40,12 @@ curl -fsSL https://raw.githubusercontent.com/SturgeonTechnologies/RCRaceHQ-LapCo
 | `--passphrase PASS` | open | Event Wi-Fi password (8-63 characters). |
 | `--country CC` | `US` | Wi-Fi country code. |
 
+**Freshly imaged Pi?** It usually runs its automatic updates in the first
+10-15 minutes after booting. The installer checks for that first and stops
+straight away with "apt is busy" (and the command to stop the updates) instead
+of waiting behind them. While it runs, it pauses the automatic updates and
+turns them back on when it finishes.
+
 `install.sh` is plain bash and does what `site.yml` does. Re-run it to update or
 change options. Prefer to read it first? `curl -fsSLO …/install.sh`, read it,
 then `sudo bash install.sh`. The Ansible playbooks below stay for managing
