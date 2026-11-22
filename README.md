@@ -92,7 +92,7 @@ commit (first run ~5-10 min on a Pi 4). Details:
 | [`race_network`](roles/race_network/README.md) | Hostname, `eth0` DHCP (default) or static; `eth0` is the only uplink |
 | [`race_hotspot`](roles/race_hotspot/README.md) | `wlan0` access point (always), captive portal to `http://race`, NAT to `eth0` |
 | [`race_dns`](roles/race_dns/README.md) | dnsmasq DHCP/DNS for the hotspot (pulled in by `race_hotspot`) |
-| [`lapcounter_app`](roles/lapcounter_app/README.md) | Docker, `/opt/lapcounter/compose.yaml` (`web` :8080 + `lapd`) |
+| [`lapcounter_app`](roles/lapcounter_app/README.md) | Docker, `/opt/lapcounter/compose.yaml` (`web` on 127.0.0.1:8080 behind the :80 portal, + `lapd`) |
 
 ## What runs on a finished Pi
 
@@ -100,7 +100,7 @@ commit (first run ~5-10 min on a Pi 4). Details:
 |---|---|---|---|
 | OpenStint decoder | `openstint.service` | ZeroMQ PUB :5556 | `/var/lib/openstint/*.rc4` |
 | lapd | container `lapcounter-lapd-1` | reads :5556 | `/var/lib/lapcounter/lapcounter.db` |
-| web | container `lapcounter-web-1` (gunicorn) | :8080 | same DB |
+| web | container `lapcounter-web-1` (gunicorn) | 127.0.0.1:8080 (Pi only; use :80) | same DB |
 | Event hotspot | NetworkManager `race-hotspot`, `race-portal-firewall.service` | — | — |
 | Captive portal | `race-portal.service` | :80 | serves the app at `http://race/` and `http://<pi>.local/` |
 | DHCP/DNS | `dnsmasq` (race_dns) | 53, 67 on `wlan0` | |

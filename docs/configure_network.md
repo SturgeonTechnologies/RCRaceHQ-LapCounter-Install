@@ -120,7 +120,7 @@ The live page has **Racing today? Check in here**. Bookmark `/kiosk` on the
 desk tablet. Admin still needs the local login.
 
 On the wired side, `http://<hostname>.local/` serves the app the same way.
-`:8080` still answers on `eth0` (old bookmarks), but nobody needs it.
+With `install.sh` the app only listens on `127.0.0.1:8080`, so port 80 is the only way in.
 
 What hotspot devices can reach on the Pi: DHCP, DNS and the portal (:80),
 which serves the app. The app's own port (`race_hotspot_app_port`), SSH and
