@@ -135,14 +135,15 @@ usage() { sed -n '4,/^# SPDX/{/^# SPDX/d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}" 
 
 # apt-get without questions; quiet unless it fails.
 apt_install() {
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+    # Lock timeout: a fresh Pi is often still running unattended-upgrades.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q -o DPkg::Lock::Timeout=600 \
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" >/dev/null
 }
 
 APT_UPDATED=0
 apt_update() {
     if [[ $APT_UPDATED -eq 0 ]]; then
-        apt-get update -q >/dev/null
+        apt-get update -q -o DPkg::Lock::Timeout=600 >/dev/null
         APT_UPDATED=1
     fi
 }
@@ -354,7 +355,7 @@ install_openstint_source() {
 
     # nfpm: the packager upstream uses. Checksum-pinned.
     local nfpm_deb="/var/cache/apt/archives/nfpm_${NFPM_VERSION}_arm64.deb"
-    if ! echo "${NFPM_SHA256_ARM64}  ${nfpm_deb}" | sha256sum -c --status 2>/dev/null; then
+    if [[ ! -f $nfpm_deb ]] || ! echo "${NFPM_SHA256_ARM64}  ${nfpm_deb}" | sha256sum -c --status 2>/dev/null; then
         curl -fsSL --retry 3 -o "$nfpm_deb" \
             "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_arm64.deb"
         echo "${NFPM_SHA256_ARM64}  ${nfpm_deb}" | sha256sum -c --status \
@@ -557,8 +558,22 @@ EOF
     write_file /etc/dnsmasq.d/race-dns.conf 0644 <"$conf" && changed=1 || true
     rm -f "$conf"
 
+    # Check the whole config dnsmasq will load, not just our file: leftovers
+    # in /etc/dnsmasq.conf or /etc/dnsmasq.d can clash with it.
+    dnsmasq --test >/dev/null 2>&1 \
+        || die "dnsmasq's full config is invalid: $(dnsmasq --test 2>&1 | tail -1)
+  Check /etc/dnsmasq.conf and other files in /etc/dnsmasq.d/."
+
     systemctl enable --quiet dnsmasq.service
-    if [[ $changed -eq 1 ]]; then systemctl restart dnsmasq.service; else systemctl start dnsmasq.service; fi
+    local action=start
+    [[ $changed -eq 1 ]] && action=restart
+    if ! systemctl "$action" dnsmasq.service; then
+        warn "dnsmasq didn't start. Its last log lines:"
+        journalctl -u dnsmasq.service -n 15 --no-pager -o cat >&2 || true
+        warn "What else is using the DNS/DHCP ports (53, 67):"
+        ss -lnup '( sport = :53 or sport = :67 )' >&2 || true
+        die "dnsmasq failed to start (details above)."
+    fi
     ok "dnsmasq: DHCP ${AP_DHCP_START}-${AP_DHCP_END}, http://${AP_HOSTNAME}/ -> ${AP_ADDRESS}"
 }
 
@@ -765,7 +780,7 @@ setup_docker() {
     done
     if [[ ${#conflicts[@]} -gt 0 ]]; then
         info "Removing packages that clash with Docker Engine: ${conflicts[*]}"
-        DEBIAN_FRONTEND=noninteractive apt-get remove -y -q "${conflicts[@]}" >/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y -q -o DPkg::Lock::Timeout=600 "${conflicts[@]}" >/dev/null
     fi
 
     local url="https://download.docker.com/linux/${OS_ID}"
