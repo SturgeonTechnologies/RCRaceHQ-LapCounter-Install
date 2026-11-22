@@ -498,30 +498,63 @@ setup_wifi_country() {
 
 setup_ap_profile() {
     local con=race-hotspot
-    nmcli -t -f NAME connection show | grep -qx "$con" \
-        || nmcli connection add type wifi con-name "$con" ifname "$WIFI_IF" ssid "$AP_SSID" >/dev/null
+    local keyfile="/etc/NetworkManager/system-connections/${con}.nmconnection"
 
-    # manual (not "shared"): dnsmasq below does DHCP/DNS, not NetworkManager's.
-    nmcli connection modify "$con" \
-        connection.interface-name "$WIFI_IF" \
-        connection.autoconnect yes \
-        connection.autoconnect-priority 100 \
-        802-11-wireless.ssid "$AP_SSID" \
-        802-11-wireless.mode ap \
-        802-11-wireless.band bg \
-        802-11-wireless.channel 6 \
-        802-11-wireless.powersave 2 \
-        ipv4.method manual \
-        ipv4.addresses "${AP_ADDRESS}/${AP_PREFIX}" \
-        ipv6.method disabled
+    # Write the profile as a plain NetworkManager keyfile. On Ubuntu,
+    # "nmcli connection add/modify" stores profiles through netplan, and netplan
+    # turns a Wi-Fi access point into "shared" mode. That starts
+    # NetworkManager's own dnsmasq on wlan0, which then blocks ours (port 53/67).
+    local uuid=""
+    [[ -f $keyfile ]] && uuid=$(sed -n 's/^uuid=//p' "$keyfile" | head -1)
+    [[ -n $uuid ]] || uuid=$(cat /proc/sys/kernel/random/uuid)
 
+    # Remove every other copy of the profile (e.g. a netplan-backed one from an
+    # earlier install) plus NetworkManager's default "Hotspot" profile.
+    local id other file
+    while IFS=: read -r id other file; do
+        [[ $id == "$con" || $id == Hotspot ]] || continue
+        [[ $other == "$uuid" && $file == "$keyfile" ]] && continue
+        nmcli connection delete "$other" >/dev/null
+        info "Removed old Wi-Fi profile '$id' ($other)"
+    done < <(nmcli -t -f NAME,UUID,FILENAME connection show 2>/dev/null)
+
+    local security=""
     if [[ -n $AP_PASSPHRASE ]]; then
-        nmcli connection modify "$con" wifi-sec.key-mgmt wpa-psk wifi-sec.proto rsn wifi-sec.psk "$AP_PASSPHRASE"
-    else
-        nmcli connection modify "$con" remove 802-11-wireless-security 2>/dev/null || true
+        security=$'\n[wifi-security]\nkey-mgmt=wpa-psk\nproto=rsn\npsk='"${AP_PASSPHRASE}"$'\n'
     fi
 
+    write_file "$keyfile" 0600 <<EOF || true
+# Managed by RC Race HQ install.sh (re-running it rewrites this).
+# ipv4 is manual, not shared: dnsmasq.service does DHCP/DNS for the event Wi-Fi.
+[connection]
+id=${con}
+uuid=${uuid}
+type=wifi
+interface-name=${WIFI_IF}
+autoconnect=true
+autoconnect-priority=100
+
+[wifi]
+mode=ap
+ssid=${AP_SSID}
+band=bg
+channel=6
+powersave=2
+${security}
+[ipv4]
+method=manual
+address1=${AP_ADDRESS}/${AP_PREFIX}
+
+[ipv6]
+method=disabled
+EOF
+
+    nmcli connection reload
     nmcli connection up "$con" >/dev/null
+
+    [[ $(nmcli -g ipv4.method connection show "$con") == manual ]] \
+        || die "The '$con' Wi-Fi profile isn't in manual mode (NetworkManager would run its own dnsmasq).
+  Check: nmcli -f NAME,UUID,FILENAME connection show; ls /etc/netplan/"
     ok "Wi-Fi \"$AP_SSID\" ($([[ -n $AP_PASSPHRASE ]] && echo WPA2 || echo open)) on $WIFI_IF, ${AP_ADDRESS}"
 }
 
@@ -563,6 +596,14 @@ EOF
     dnsmasq --test >/dev/null 2>&1 \
         || die "dnsmasq's full config is invalid: $(dnsmasq --test 2>&1 | tail -1)
   Check /etc/dnsmasq.conf and other files in /etc/dnsmasq.d/."
+
+    # NetworkManager runs its own dnsmasq for "shared" profiles; it holds the
+    # same ports, so ours can't start.
+    if pgrep -f -- '--conf-file=/dev/null --no-hosts' >/dev/null; then
+        die "NetworkManager is running its own dnsmasq (a Wi-Fi profile in 'shared' mode).
+  Find it with: nmcli -f NAME,UUID,FILENAME connection show
+  Delete that profile (and any /etc/netplan/90-NM-*.yaml for it), then run this again."
+    fi
 
     systemctl enable --quiet dnsmasq.service
     local action=start
