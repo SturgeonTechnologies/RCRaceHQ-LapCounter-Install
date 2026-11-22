@@ -16,7 +16,7 @@
 #                  at http://race/  (skip with --no-ap)
 #   5. Docker      Docker Engine + compose plugin from Docker's signed repo
 #   6. App         lapd + web + syncd containers, pinned to one image build
-#   7. Check       app on :8080, portal on :80, decoder running
+#   7. Check       portal on :80, app behind it (Pi-only :8080), decoder running
 #
 # Safe to run again: re-running is also how you update or change options.
 #
@@ -952,13 +952,17 @@ EOF
 
     write_file "${APP_DIR}/compose.yaml" 0644 <<EOF || true
 # Managed by RC Race HQ install.sh (re-run it to change the image).
-# Host networking: lapd reads the decoder on 127.0.0.1, web listens on :${APP_PORT}.
+# Host networking: lapd reads the decoder on 127.0.0.1. web listens on
+# 127.0.0.1:${APP_PORT} only; everyone uses port 80 (race-portal), which proxies to it.
 name: lapcounter
 services:
   web:
     image: "${IMAGE_REF}"
     network_mode: host
     restart: unless-stopped
+    # Same as the image's CMD, but bound to the Pi itself (no outside :${APP_PORT}).
+    command: ["gunicorn", "--worker-class", "gthread", "--workers", "2", "--threads", "16",
+              "--bind", "127.0.0.1:${APP_PORT}", "--access-logfile", "-", "lapcounter.web:create_app()"]
     environment:
       LAPCOUNTER_DB: ${APP_DATA_DIR}/lapcounter.db
       LAPCOUNTER_DECODER_STALE_S: "5"
@@ -1014,7 +1018,7 @@ check_result() {
         sleep 3
     done
     if curl -fsS -m 3 -o /dev/null "http://127.0.0.1:${APP_PORT}/healthz"; then
-        ok "App answers on :${APP_PORT}"
+        ok "App answers on 127.0.0.1:${APP_PORT} (Pi only)"
     else
         warn "App isn't answering on :${APP_PORT}. Logs: cd ${APP_DIR} && sudo docker compose logs web"
         failed=1

@@ -55,7 +55,7 @@ On the target Pi (`become: true`):
 
 ## Transponder learning
 
-Learning is done in the app: **Admin → Transponders** (`http://<pi>:8080/transponders`).
+Learning is done in the app: **Admin → Transponders** (`http://<pi>.local/transponders`).
 Type the number on the label, set the transponder still on the loop or pad,
 wait for **Record**, press it. The app renames OpenStint's auto-numbered
 `<1000-9999>.rc4` to `<label>.rc4` in `/var/lib/openstint`, so the `web`
@@ -80,7 +80,7 @@ sudo docker compose exec web ls -ld /var/lib/openstint
 
 ## Linking to RC Race HQ
 
-**Settings → Link to RC Race HQ** (`http://<pi>:8080/settings`) pairs the Pi
+**Settings → Link to RC Race HQ** (`http://<pi>.local/settings`) pairs the Pi
 with one track of a club: it shows a code, a club manager types it under
 **Manage → club → Lap counters** in RC Race HQ, and the Pi stores its new IoT
 certificate. The role only has to tell the app where the API is:
@@ -136,7 +136,7 @@ ansible-playbook -i inventory/race_decoders.yml deploy_lapcounter_app.yml \
 `--check` works once Docker is installed (the first run has no
 `docker.service` to look at yet).
 
-Then open `http://racedecoder.local:8080/`. The first visit goes to **Set up
+Then open `http://racedecoder.local/`. The first visit goes to **Set up
 the lap counter**.
 
 ## Upgrade and roll back
