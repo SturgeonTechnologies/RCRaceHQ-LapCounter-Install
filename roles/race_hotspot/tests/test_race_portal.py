@@ -219,7 +219,8 @@ class _FakeApp(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
         type(self).seen.append({"method": self.command, "path": self.path,
-                                "headers": dict(self.headers), "body": body})
+                                "headers": dict(self.headers), "body": body,
+                                "content_lengths": self.headers.get_all("Content-Length") or []})
         if self.path == "/stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -325,6 +326,16 @@ def test_post_body_and_app_redirects_pass_through(monkeypatch, app_server):
         assert _FakeApp.seen[-1]["body"] == b"phone=5551234567"
         status, headers, _ = _req(srv.server_address[1], "race", "/go")
         assert status == 302 and headers["Location"] == "/kiosk"
+    finally:
+        srv.shutdown()
+
+
+def test_post_sends_one_content_length(monkeypatch, app_server):
+    # gunicorn answers 400 "Invalid HTTP Header: 'CONTENT-LENGTH'" to a repeat.
+    srv, _ = _portal_with_app(monkeypatch, app_server, HOTSPOT_ENV)
+    try:
+        _req(srv.server_address[1], "race", "/setup", method="POST", data=b"password=hunter22")
+        assert _FakeApp.seen[-1]["content_lengths"] == ["17"]
     finally:
         srv.shutdown()
 

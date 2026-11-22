@@ -105,8 +105,12 @@ GRANT_REFRESH = 600           # re-run nft for a client at most every 10 min
 def upstream_headers(headers, client: str) -> list[tuple[str, str]]:
     """Request headers to send the app: hop-by-hop and client forwarding headers
     dropped, X-Forwarded-For set to the address we actually saw."""
+    # Content-Length is dropped too: the proxy sets it from the body it actually
+    # read, and sending the client's copy as well gives two, which gunicorn
+    # rejects with "Invalid HTTP Header: 'CONTENT-LENGTH'".
     out = [(k, v) for k, v in headers.items()
-           if k.lower() not in HOP_BY_HOP and k.lower() not in CLIENT_FORWARDING]
+           if k.lower() not in HOP_BY_HOP and k.lower() not in CLIENT_FORWARDING
+           and k.lower() != "content-length"]
     out.append(("X-Forwarded-For", client))
     out.append(("X-Forwarded-Proto", "http"))
     host = headers.get("Host")
