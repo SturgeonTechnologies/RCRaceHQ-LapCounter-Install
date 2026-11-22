@@ -14,6 +14,37 @@ The lap counter works on its own at the track. Event sync, uploads and the
 shared transponder library need an RC Race HQ club to pair with
 (Settings → Link on the Pi).
 
+## Quick install (one command, on the Pi)
+
+Image the Pi with Raspberry Pi OS Lite (64-bit, Trixie) or Ubuntu 24.04+ arm64,
+plug in Ethernet and the RTL-SDR, then log in as your normal user and run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SturgeonTechnologies/RCRaceHQ-LapCounter-Install/main/install.sh | sudo bash
+```
+
+Options go after `bash -s --`:
+
+```bash
+# no event Wi-Fi, a specific build
+curl -fsSL https://raw.githubusercontent.com/SturgeonTechnologies/RCRaceHQ-LapCounter-Install/main/install.sh \
+  | sudo bash -s -- --no-ap sha-1a2b3c4
+```
+
+| Option | Default | What it does |
+|---|---|---|
+| `TAG` (first plain argument) or `--tag TAG` | `latest` | Image build: `latest`, `sha-1a2b3c4`, `1a2b3c4` or `v1.2.3`. `latest` is resolved to its exact build when you install, so the Pi doesn't change until you re-run. |
+| `--no-ap` | event Wi-Fi on | Don't turn `wlan0` into the event Wi-Fi. The app is still at `http://<hostname>.local/` on the wired side. |
+| `--hostname NAME` | unchanged | Rename the Pi (and its `.local` name). |
+| `--ssid NAME` | `RC Race Event` | Event Wi-Fi name. |
+| `--passphrase PASS` | open | Event Wi-Fi password (8-63 characters). |
+| `--country CC` | `US` | Wi-Fi country code. |
+
+`install.sh` is plain bash and does what `site.yml` does. Re-run it to update or
+change options. Prefer to read it first? `curl -fsSLO …/install.sh`, read it,
+then `sudo bash install.sh`. The Ansible playbooks below stay for managing
+several Pis from a laptop.
+
 ## Playbooks
 
 | Playbook | What it does | Docs |
