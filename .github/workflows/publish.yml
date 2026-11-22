@@ -1,0 +1,77 @@
+name: publish
+
+# Puts install.sh on the public site after CI passes on main:
+#   https://www.rcracehq.com/lapcounter/install.sh
+#
+# The published copy has INSTALL_REF pinned to the commit it came from, so the
+# helper files it downloads always match it, even while main moves on.
+# AWS: rcracehq-lapcounter-publish (RCRaceHQ infrastructure/lapcounter-publish-oidc.yml),
+# which can only write lapcounter/* in the site bucket and invalidate it.
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-installer
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    environment: lapcounter-publish
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      PUBLIC_URL: https://www.rcracehq.com/lapcounter/install.sh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+
+      - name: Pin INSTALL_REF to this commit
+        run: |
+          mkdir -p out
+          sed -E 's|^INSTALL_REF="\$\{INSTALL_REF:-main\}"$|INSTALL_REF="${INSTALL_REF:-'"$SHA"'}"|' install.sh > out/install.sh
+          grep -qxF "INSTALL_REF=\"\${INSTALL_REF:-$SHA}\"" out/install.sh \
+            || { echo "::error::INSTALL_REF line not found in install.sh"; exit 1; }
+          bash -n out/install.sh
+          (cd out && sha256sum install.sh > install.sh.sha256)
+          cat out/install.sh.sha256
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Upload
+        run: |
+          for f in install.sh install.sh.sha256; do
+            aws s3 cp "out/$f" "s3://${{ vars.SITE_BUCKET }}/lapcounter/$f" \
+              --content-type "text/plain; charset=utf-8" \
+              --cache-control "public, max-age=300"
+          done
+
+      - name: Invalidate CDN
+        run: |
+          id=$(aws cloudfront create-invalidation --distribution-id "${{ vars.DISTRIBUTION_ID }}" \
+                 --paths "/lapcounter/*" --query Invalidation.Id --output text)
+          aws cloudfront wait invalidation-completed --distribution-id "${{ vars.DISTRIBUTION_ID }}" --id "$id"
+
+      - name: Check the public copy
+        run: |
+          curl -fsSL "$PUBLIC_URL" -o public.sh
+          sha256sum public.sh | cut -d' ' -f1 > got
+          cut -d' ' -f1 out/install.sh.sha256 > want
+          diff -u want got || { echo "::error::$PUBLIC_URL does not match the published file"; exit 1; }
+          echo "Published $PUBLIC_URL at ${SHA::7}"

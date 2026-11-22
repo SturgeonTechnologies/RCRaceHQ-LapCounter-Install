@@ -20,14 +20,18 @@ Image the Pi with Raspberry Pi OS Lite (64-bit, Trixie) or Ubuntu 24.04+ arm64,
 plug in Ethernet and the RTL-SDR, then log in as your normal user and run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SturgeonTechnologies/RCRaceHQ-LapCounter-Install/main/install.sh | sudo bash
+curl -fsSL https://www.rcracehq.com/lapcounter/install.sh | sudo bash
 ```
+
+That copy is published from `main` after CI passes, pinned to that commit (see
+[Publishing](#publishing-the-installer)). Straight from GitHub works too:
+`curl -fsSL https://raw.githubusercontent.com/SturgeonTechnologies/RCRaceHQ-LapCounter-Install/main/install.sh | sudo bash`.
 
 Options go after `bash -s --`:
 
 ```bash
 # no event Wi-Fi, a specific build
-curl -fsSL https://raw.githubusercontent.com/SturgeonTechnologies/RCRaceHQ-LapCounter-Install/main/install.sh \
+curl -fsSL https://www.rcracehq.com/lapcounter/install.sh \
   | sudo bash -s -- --no-ap sha-1a2b3c4
 ```
 
@@ -127,3 +131,27 @@ for p in provision_race_decoder configure_network deploy_lapcounter_app site; do
 Source-available under [FSL-1.1-ALv2](LICENSE) (each version becomes Apache-2.0
 two years after its release). Plain-language summary: [LICENSING.md](LICENSING.md).
 "RC Race HQ" is a trademark of Sturgeon Technologies LLC.
+
+## Publishing the installer
+
+`.github/workflows/publish.yml` runs after CI passes on `main`. It:
+
+1. Pins `INSTALL_REF` in `install.sh` to that commit, so the helper files it
+   downloads (portal, `openstint-learn`) always match the script.
+2. Uploads `lapcounter/install.sh` and `lapcounter/install.sh.sha256` to the RC
+   Race HQ prod site bucket (5-minute cache).
+3. Invalidates `/lapcounter/*`, waits, then downloads the public URL and checks
+   the checksum.
+
+AWS access is the `rcracehq-lapcounter-publish` OIDC role
+(`infrastructure/lapcounter-publish-oidc.yml` in RCRaceHQ). It can only write
+`lapcounter/*` and invalidate that distribution. The job runs in the
+`lapcounter-publish` Environment (main branch only), whose variables are
+`AWS_ROLE_ARN`, `SITE_BUCKET` and `DISTRIBUTION_ID`.
+
+Check a download by hand:
+
+```bash
+curl -fsSLO https://www.rcracehq.com/lapcounter/install.sh
+curl -fsSL https://www.rcracehq.com/lapcounter/install.sh.sha256 | sha256sum -c -
+```

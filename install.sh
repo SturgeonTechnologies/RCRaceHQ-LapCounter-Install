@@ -3,7 +3,7 @@
 #
 # install.sh — set up a Raspberry Pi as an RC Race HQ lap counter.
 #
-#   curl -fsSL https://raw.githubusercontent.com/SturgeonTechnologies/RCRaceHQ-LapCounter-Install/main/install.sh | sudo bash
+#   curl -fsSL https://www.rcracehq.com/lapcounter/install.sh | sudo bash
 #
 # Plain bash, no Ansible. Does the same thing as site.yml in this repo:
 #
@@ -37,7 +37,8 @@
 #   curl -fsSL .../install.sh | sudo bash -s -- --no-ap sha-1a2b3c4
 #
 # Environment (optional):
-#   INSTALL_REF          Branch/tag of this repo to fetch helper files from (main)
+#   INSTALL_REF          Branch/tag/commit of this repo to fetch helper files
+#                        from (main; the rcracehq.com copy is pinned to its commit)
 #   GHCR_USER/GHCR_TOKEN Registry login, only for a private image
 #
 # Full log: /var/log/lapcounter-install.log

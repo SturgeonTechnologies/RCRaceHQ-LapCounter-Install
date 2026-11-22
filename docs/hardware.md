@@ -37,7 +37,6 @@ Quantities are per kit.
 | 1 | USB-C power supply, 5.1 V 3 A (official Pi 4 PSU) | Skip if using a PoE HAT (see optional) |
 | 1 | microSD card, 32 GB, A1/A2 class | Holds the OS, Docker images, SQLite and `.rc4` files |
 | 1 | RTL-SDR Blog V3 dongle | 5 MHz via Q-branch direct sampling (OpenStint switches this on by itself). The V4 also works |
-| 1 | USB-A extension, 15–30 cm (male to female) | Keeps the dongle away from the Pi and off the HAT. Less noise, less heat |
 | 1 | Ethernet cable | `eth0` is the internet uplink by default |
 | 1 | Case that fits a HAT, or open frame with standoffs | The HAT needs clearance above the 40-pin header and two SMA jacks on the left edge |
 
@@ -46,7 +45,7 @@ Quantities are per kit.
 | Qty | Part | Notes |
 |---|---|---|
 | 1 | Speaker wire, 2-conductor, 16–18 AWG | Length = track width + lead to the balun. A 15 m (50 ft) spool covers most club tracks |
-| 1 | Resistor, 470 Ω, 1/2 W or more | Terminates the far end of the loop. 330–470 Ω per OpenStint's setup guide |
+| 1 | Resistor, 390 Ω (330–470 Ω), 1/2 W or more | Terminates the far end of the loop, per OpenStint's setup guide. On a small desk test loop, leave it off |
 | 1 | 1:9 HF balun/unun (1–30 MHz) | Near end of the loop. Most have an SO-239 (UHF) jack |
 | 1 | Coax, balun to Pi, with **PL-259 → SMA male** ends | RG-58 for long runs, RG-316 for short ones. Length = balun to where the Pi sits. Add an adapter if your balun has BNC or SMA |
 | 1 | Weatherproof box or tape for the balun + termination | Outdoor tracks |
@@ -72,6 +71,7 @@ runs today).
 
 | Qty | Part | Notes |
 |---|---|---|
+| 1 | USB-A extension, 15–30 cm (male to female) | Only if the dongle won't fit or runs hot. Try without first: on a test Pi an extension added noise. Use a black USB 2 port either way |
 | 1 | Powered speaker / PA with 3.5 mm input | Announcer. HDMI carries the same audio |
 | 1 | Raspberry Pi PoE+ HAT + PoE switch/injector | One cable for power + network. **Stacking order with the burst HAT isn't decided yet**, so hold off unless you want to experiment |
 
@@ -158,7 +158,7 @@ breadboard, with a solid ground rail. Long jumpers at 5 MHz will pick up noise.
                          TRACK (top view)
    ┌──────────────────────────────────────────────────────┐
    │   wire A  ═══════════════════════════════════════╗   │
-   │                     ~30 cm apart                  [R] 470 Ω termination
+   │                     ~30 cm apart                  [R] 390 Ω termination
    │   wire B  ═══════════════════════════════════════╝   │
    └───╥──────────────────────────────────────────────────┘
        ║  speaker-wire pair (near end)
@@ -178,7 +178,7 @@ breadboard, with a solid ground rail. Long jumpers at 5 MHz will pick up noise.
    │   └─────────────────────────────────────────────────────────┼────────┘  │
    │                                                    SMA–SMA  │ cable     │
    │                                                             v           │
-   │   USB ◄── 15–30 cm USB extension ◄── RTL-SDR Blog V3 (antenna SMA)      │
+   │   USB 2 (black) port ◄── RTL-SDR Blog V3 (antenna SMA)                  │
    │                                                                         │
    │   eth0 ◄── Ethernet (internet uplink)                                   │
    │   wlan0 ──► "RC Race Event" hotspot (phones, captive portal)            │
