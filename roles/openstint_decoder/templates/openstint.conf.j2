@@ -1,6 +1,0 @@
-# /etc/openstint.conf -- managed by Ansible (RCRaceHQ-LapCounter-Install role openstint_decoder).
-# Local edits are overwritten on the next run; change the role vars instead.
-#
-# systemd EnvironmentFile, not a shell script. See the upstream copy of this
-# file for every flag: -g gain, -s registry dir, -p ZeroMQ port, -m monitor.
-OPENSTINT_ARGS="-g {{ openstint_decoder_gain }} -s {{ openstint_decoder_registry_dir }} -p {{ openstint_decoder_zmq_port }}{{ (' ' ~ openstint_decoder_extra_args) if openstint_decoder_extra_args | length > 0 else '' }}"

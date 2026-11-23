@@ -1,6 +1,6 @@
 # RCRaceHQ-LapCounter-Install
 
-Ansible that turns a Raspberry Pi 4 + RTL-SDR into an [RC Race HQ](https://www.rcracehq.com)
+One bash script that turns a Raspberry Pi 4 + RTL-SDR into an [RC Race HQ](https://www.rcracehq.com)
 lap counter: the OpenStint decoder, the event Wi-Fi with its captive portal,
 and the lap counter app.
 
@@ -44,59 +44,30 @@ curl -fsSL https://www.rcracehq.com/lapcounter/install.sh \
 | `--passphrase PASS` | open | Event Wi-Fi password (8-63 characters). |
 | `--country CC` | `US` | Wi-Fi country code. |
 
-`install.sh` is plain bash and does what `site.yml` does. Re-run it to update or
-change options. Prefer to read it first? `curl -fsSLO …/install.sh`, read it,
-then `sudo bash install.sh`. The Ansible playbooks below stay for managing
-several Pis from a laptop.
+`install.sh` is plain bash. Re-run it to update or change options; finished
+steps are skipped. Prefer to read it first? `curl -fsSLO …/install.sh`, read
+it, then `sudo bash install.sh`. Full log: `/var/log/lapcounter-install.log`.
 
-## Playbooks
+On Ubuntu the installer builds OpenStint from a pinned upstream commit, so the
+first run takes about 5-10 minutes on a Pi 4.
 
-| Playbook | What it does | Docs |
-|---|---|---|
-| `provision_race_decoder.yml` | OpenStint decoder + `openstint-learn`, event hotspot + captive portal (wlan0 always) | [docs/provision_race_decoder.md](docs/provision_race_decoder.md) |
-| `configure_network.yml` | Only the Pi's network: hostname, eth0, event AP on wlan0 (also part of provisioning) | [docs/configure_network.md](docs/configure_network.md) |
-| `deploy_lapcounter_app.yml` | Docker + the lap counter app from GHCR (pinned tag) | [docs/deploy_lapcounter_app.md](docs/deploy_lapcounter_app.md) |
-| `site.yml` | Provision, then deploy (a new Pi) | |
+After it finishes: open `http://<hostname>.local/` from the wired side, or join
+the **RC Race Event** Wi-Fi and open `http://race/`. On the Pi,
+`journalctl -u openstint -f` shows decoder `S` lines every second.
 
 ## Hardware
 
 Parts list, loop wiring and an ASCII schematic: [docs/hardware.md](docs/hardware.md).
 
-## Quick start (new Pi)
+## What's in this repo
 
-1. Image the Pi: Raspberry Pi OS Lite (64-bit, Trixie) or Ubuntu 24.04+ arm64,
-   hostname `racedecoder`, user `pi`, your SSH key. Plug in the RTL-SDR and Ethernet.
-2. On your laptop, from this repo:
-
-   ```bash
-   ansible-galaxy collection install -r collections/requirements.yml
-   ```
-
-3. Set `lapcounter_app_image_tag` in `inventory/race_decoders.yml`
-   ([how to pick one](docs/deploy_lapcounter_app.md#run-it)).
-4. Run everything, over Ethernet:
-
-   ```bash
-   ansible-playbook -i inventory/race_decoders.yml site.yml -K
-   ```
-
-5. Check: `http://racedecoder.local/` from the wired side, or join the
-   **RC Race Event** Wi-Fi and open `http://race/`. On the Pi,
-   `journalctl -u openstint -f` shows decoder `S` lines every second.
-
-On Ubuntu the `openstint_decoder` role builds OpenStint from a pinned upstream
-commit (first run ~5-10 min on a Pi 4). Details:
-[docs/provision_race_decoder.md](docs/provision_race_decoder.md#ubuntu-source-build).
-
-## Roles
-
-| Role | On the Pi |
+| Path | What it is |
 |---|---|
-| [`openstint_decoder`](roles/openstint_decoder/README.md) | `openstint` package (pinned apt repo or source build), `/etc/openstint.conf`, `openstint-learn`, optional ufw |
-| [`race_network`](roles/race_network/README.md) | Hostname, `eth0` DHCP (default) or static; `eth0` is the only uplink |
-| [`race_hotspot`](roles/race_hotspot/README.md) | `wlan0` access point (always), captive portal to `http://race`, NAT to `eth0` |
-| [`race_dns`](roles/race_dns/README.md) | dnsmasq DHCP/DNS for the hotspot (pulled in by `race_hotspot`) |
-| [`lapcounter_app`](roles/lapcounter_app/README.md) | Docker, `/opt/lapcounter/compose.yaml` (`web` on 127.0.0.1:8080 behind the :80 portal, + `lapd`) |
+| `install.sh` | The installer |
+| `files/race-portal` | Port 80 captive portal / proxy to the app (installed to `/usr/local/sbin`) |
+| `files/openstint-learn` | Transponder learning helper (installed to `/usr/local/bin`) |
+| `tests/` | pytest for the two helpers |
+| `docs/hardware.md` | Parts list and loop wiring |
 
 ## What runs on a finished Pi
 
@@ -107,23 +78,20 @@ commit (first run ~5-10 min on a Pi 4). Details:
 | web | container `lapcounter-web-1` (gunicorn) | 127.0.0.1:8080 (Pi only; use :80) | same DB |
 | Event hotspot | NetworkManager `race-hotspot`, `race-portal-firewall.service` | — | — |
 | Captive portal | `race-portal.service` | :80 | serves the app at `http://race/` and `http://<pi>.local/` |
-| DHCP/DNS | `dnsmasq` (race_dns) | 53, 67 on `wlan0` | |
+| DHCP/DNS | `dnsmasq` (`/etc/dnsmasq.d/race-dns.conf`) | 53, 67 on `wlan0` | |
 
 ## OpenStint
 
 [OpenStint](https://github.com/zsellera/openstint) is a separate program by
-its own authors under GPL-3.0. These playbooks install it from upstream; none
+its own authors under GPL-3.0. The installer installs it from upstream (or builds it from source on Ubuntu); none
 of its code is in this repo.
 
 ## Tests
 
 ```bash
-python3 -m pip install --user pytest pyzmq ansible-core ansible-lint
-python3 -m pytest roles -q
-ansible-lint
-ansible-playbook -i localhost, roles/race_network/tests/validate_localhost.yml
-for p in provision_race_decoder configure_network deploy_lapcounter_app site; do
-  ansible-playbook -i inventory/race_decoders.yml $p.yml --syntax-check; done
+python3 -m pip install --user pytest pyzmq
+python3 -m pytest tests -q
+shellcheck install.sh
 ```
 
 ## License
