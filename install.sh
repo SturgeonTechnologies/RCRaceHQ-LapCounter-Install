@@ -5,7 +5,7 @@
 #
 #   curl -fsSL https://www.rcracehq.com/lapcounter/install.sh | sudo bash
 #
-# Plain bash, no Ansible. Does the same thing as site.yml in this repo:
+# Plain bash, no Ansible. What it does:
 #
 #   1. Checks      arm64 Pi, Raspberry Pi OS Trixie (Debian 13+) or Ubuntu 24.04+,
 #                  run with sudo by a normal user, wired network up
@@ -425,7 +425,7 @@ EOF
 
     local learn
     learn=$(mktemp)
-    fetch_repo_file roles/openstint_decoder/files/openstint-learn "$learn"
+    fetch_repo_file files/openstint-learn "$learn"
     install -o root -g root -m 0755 "$learn" /usr/local/bin/openstint-learn
     rm -f "$learn"
 
@@ -707,7 +707,7 @@ EOF
 setup_portal() {
     local portal
     portal=$(mktemp)
-    fetch_repo_file roles/race_hotspot/files/race-portal "$portal"
+    fetch_repo_file files/race-portal "$portal"
     install -o root -g root -m 0755 "$portal" /usr/local/sbin/race-portal
     rm -f "$portal"
 

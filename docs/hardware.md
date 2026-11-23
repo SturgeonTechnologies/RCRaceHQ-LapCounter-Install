@@ -33,7 +33,7 @@ Quantities are per kit.
 
 | Qty | Part | Notes |
 |---|---|---|
-| 1 | Raspberry Pi 4 Model B, 2 GB or more | Kit baseline. Pi OS Trixie 64-bit or Ubuntu 24.04 arm64 both work with these playbooks |
+| 1 | Raspberry Pi 4 Model B, 2 GB or more | Kit baseline. Pi OS Trixie 64-bit or Ubuntu 24.04 arm64 both work with the installer |
 | 1 | USB-C power supply, 5.1 V 3 A (official Pi 4 PSU) | Skip if using a PoE HAT (see optional) |
 | 1 | microSD card, 32 GB, A1/A2 class | Holds the OS, Docker images, SQLite and `.rc4` files |
 | 1 | RTL-SDR Blog V3 dongle | 5 MHz via Q-branch direct sampling (OpenStint switches this on by itself). The V4 also works |

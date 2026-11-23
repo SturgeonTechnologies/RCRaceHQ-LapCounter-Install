@@ -17,7 +17,7 @@ sync, uploads and the transponder library).
 
 ## Which license covers what
 
-- **Software** (playbooks, roles, docs, scripts): [Functional Source License 1.1,
+- **Software** (install script, helper files, docs): [Functional Source License 1.1,
   Apache 2.0 Future License](LICENSE) (`FSL-1.1-ALv2`). Each version becomes
   Apache-2.0 two years after it is released.
 - **OpenStint** (the RF decoder the Pi runs) is a separate program by its own
