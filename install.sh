@@ -365,11 +365,11 @@ apt_lock_holders() {
     for f in "${APT_LOCKS[@]}"; do
         [[ -e $f ]] || continue
         inode=$(stat -c %i "$f")
-        for pid in $(awk -v ino="$inode" '$2 != "->" { n = split($6, d, ":"); if (d[n] == ino) print $5 }' /proc/locks); do
+        while read -r pid; do
             [[ $pid =~ ^[0-9]+$ && -z ${seen[$pid]:-} ]] || continue
             seen[$pid]=1
             ps -o pid=,args= -p "$pid" 2>/dev/null | cut -c1-100 || true
-        done
+        done < <(awk -v ino="$inode" '$2 != "->" { n = split($6, d, ":"); if (d[n] == ino) print $5 }' /proc/locks)
     done
 }
 
@@ -381,7 +381,10 @@ check_apt() {
     done
     if [[ -n $holders || ${#running[@]} -gt 0 ]]; then
         local busy=""
-        [[ -n $holders ]] && busy+=$(sed 's/^ */    /' <<<"$holders")$'\n'
+        local line
+        while read -r line; do
+            [[ -n $line ]] && busy+="    ${line}"$'\n'
+        done <<<"$holders"
         [[ ${#running[@]} -gt 0 ]] && busy+="    running: ${running[*]}"$'\n'
         die "apt is busy, most likely with automatic updates (normal on a freshly imaged Pi).
 ${busy}  Either wait for it to finish (usually 5-15 minutes) and run this again, or stop it now:
