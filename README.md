@@ -43,6 +43,7 @@ curl -fsSL https://www.rcracehq.com/lapcounter/install.sh \
 | `--ssid NAME` | `RC Race Event` | Event Wi-Fi name. |
 | `--passphrase PASS` | open | Event Wi-Fi password (8-63 characters). |
 | `--country CC` | `US` | Wi-Fi country code. |
+| `--no-screen` | status screen on | Leave the console (tty1) as a login prompt instead of the status screen. |
 
 `install.sh` is plain bash. Re-run it to update or change options; finished
 steps are skipped. Prefer to read it first? `curl -fsSLO …/install.sh`, read
@@ -54,6 +55,30 @@ first run takes about 5-10 minutes on a Pi 4.
 After it finishes: open `http://<hostname>.local/` from the wired side, or join
 the **RC Race Event** Wi-Fi and open `http://race/`. On the Pi,
 `journalctl -u openstint -f` shows decoder `S` lines every second.
+
+## Status screen
+
+Any screen on the Pi's console (HDMI, or a small SPI LCD once its overlay is
+set up) shows a status page that refreshes every 2 seconds:
+
+- **Wired:** the `eth0` address and whether there's internet, or `OFFLINE`
+- **Wi-Fi:** the event Wi-Fi name, `http://race/`, and how many devices joined
+- **Race:** the heat on track (starting / racing / time left / leader), else
+  the last one
+- **Problems** in red: SDR not plugged in, decoder stopped or silent, noisy
+  RF (noise floor above -30 dBFS), app or portal not answering, Wi-Fi down
+
+On a colour screen it draws a dashboard: a header with the clock, Network and
+Race cards (the race clock in big digits, coloured by phase), and a bottom
+panel that is green with an RF noise meter when all is well, or red with the
+problems listed. It's laid out for a 480x320 LCD and scaled to bigger screens.
+Without a framebuffer, or with `STATUS_MODE=text` in the unit, it shows the
+same information as coloured text.
+
+![Status screen: all OK, SDR unplugged, noisy RF](docs/status-screen.png)
+
+It replaces the login prompt on tty1; press Alt+F2 for a login. Logs:
+`journalctl -u lapcounter-status`.
 
 ## Hardware
 

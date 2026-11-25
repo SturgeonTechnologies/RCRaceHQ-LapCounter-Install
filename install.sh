@@ -16,7 +16,8 @@
 #                  at http://race/  (skip with --no-ap)
 #   5. Docker      Docker Engine + compose plugin from Docker's signed repo
 #   6. App         lapd + web + syncd containers, pinned to one image build
-#   7. Check       portal on :80, app behind it (Pi-only :8080), decoder running
+#   7. Screen      status screen on the console (skip with --no-screen)
+#   8. Check       portal on :80, app behind it (Pi-only :8080), decoder running
 #
 # Safe to run again: re-running is also how you update or change options.
 #
@@ -31,6 +32,9 @@
 #   --ssid NAME          Event Wi-Fi name          (default: RC Race Event)
 #   --passphrase PASS    Event Wi-Fi password, 8-63 characters (default: open)
 #   --country CC         Wi-Fi country code         (default: US)
+#   --no-screen          Don't put the status screen on the console (tty1).
+#                        Normally tty1 shows the wired IP, the event Wi-Fi, the
+#                        race on track and any problems (SDR unplugged, ...).
 #   -h, --help           Show this help.
 #
 # Pass options through the pipe with "bash -s --":
@@ -99,6 +103,7 @@ readonly PORTAL_PORT=80
 # ── Defaults for the options ─────────────────────────────────────────────────
 TAG="latest"
 WITH_AP=1
+WITH_SCREEN=1
 NEW_HOSTNAME=""
 AP_SSID="RC Race Event"
 AP_PASSPHRASE=""
@@ -191,6 +196,7 @@ parse_args() {
         case $1 in
             -h|--help)     usage; exit 0 ;;
             --no-ap)       WITH_AP=0 ;;
+            --no-screen)   WITH_SCREEN=0 ;;
             --tag)         TAG=${2:?--tag needs a value}; tag_set=1; shift ;;
             --hostname)    NEW_HOSTNAME=${2:?--hostname needs a value}; shift ;;
             --ssid)        AP_SSID=${2:?--ssid needs a value}; shift ;;
@@ -1008,7 +1014,74 @@ EOF
 }
 
 # ════════════════════════════════════════════════════════════════════════════
-#  7. Check
+#  7. Status screen
+# ════════════════════════════════════════════════════════════════════════════
+
+# The console (tty1), so an attached LCD or HDMI screen shows the wired
+# IP, the event Wi-Fi, the race on track and any problems. tty1 has no login
+# prompt while it runs; Alt+F2 still gives one.
+setup_status_screen() {
+    local unit=/etc/systemd/system/lapcounter-status.service
+    if [[ $WITH_SCREEN -eq 0 ]]; then
+        if [[ -f $unit ]]; then
+            systemctl disable --now --quiet lapcounter-status.service || true
+            rm -f "$unit" /usr/local/sbin/lapcounter-status
+            systemctl daemon-reload
+            systemctl start getty@tty1.service || true
+        fi
+        info "Status screen skipped (--no-screen)"
+        return 0
+    fi
+
+    # Pillow + fonts draw the colour dashboard; without a framebuffer the
+    # script falls back to coloured console text.
+    apt_install python3-pil fonts-dejavu-core
+
+    local script
+    script=$(mktemp)
+    fetch_repo_file files/lapcounter-status "$script"
+    install -o root -g root -m 0755 "$script" /usr/local/sbin/lapcounter-status
+    rm -f "$script"
+
+    write_file "$unit" 0644 <<EOF || true
+# Managed by RC Race HQ install.sh.
+[Unit]
+Description=Lap counter status screen (tty1)
+After=network-online.target openstint.service race-portal.service getty@tty1.service
+Conflicts=getty@tty1.service
+
+[Service]
+Environment=STATUS_APP_PORT=${APP_PORT}
+Environment=STATUS_WIRED_IF=${WIRED_IF}
+Environment=STATUS_WIFI_IF=${WIFI_IF}
+Environment=STATUS_STATE_FILE=${STATE_FILE}
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/lapcounter-status
+StandardInput=null
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --quiet lapcounter-status.service
+    systemctl restart lapcounter-status.service
+    ok "Status screen on the console (tty1)"
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+#  8. Check
 # ════════════════════════════════════════════════════════════════════════════
 
 check_result() {
@@ -1100,6 +1173,9 @@ main() {
 
     step "Lap counter app"
     setup_app
+
+    step "Status screen"
+    setup_status_screen
 
     step "Check"
     if check_result; then

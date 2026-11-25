@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""lapcounter-status: a one-glance status screen for the lap counter.
+
+Draws on the Pi's text console (tty1), so it shows on whatever screen the
+console is on: a small SPI LCD, or HDMI. Every few seconds it redraws:
+
+  * Wired   eth0 address, or why there isn't one (no cable / no address)
+  * Wi-Fi   the event Wi-Fi name and how many devices have joined
+  * Race    the heat on track (phase, time left, leader), else the last one
+  * Problems, in plain words: SDR unplugged, decoder stopped or silent,
+    noisy RF, app or portal not answering
+
+It only reads: /sys, `systemctl is-active`, the dnsmasq lease file and the
+app's public endpoints on 127.0.0.1.
+
+On a colour screen (/dev/fb0 plus Pillow) it draws a graphical dashboard;
+otherwise, or with STATUS_MODE=text, it falls back to coloured console text.
+
+SPDX-License-Identifier: LicenseRef-FSL-1.1-ALv2
+Copyright 2026 Sturgeon Technologies LLC
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from dataclasses import dataclass, field
+
+APP_PORT = int(os.environ.get("STATUS_APP_PORT", "8080"))
+WIRED_IF = os.environ.get("STATUS_WIRED_IF", "eth0")
+WIFI_IF = os.environ.get("STATUS_WIFI_IF", "wlan0")
+STATE_FILE = os.environ.get("STATUS_STATE_FILE", "/etc/lapcounter-install.conf")
+LEASES = os.environ.get("STATUS_LEASES", "/var/lib/misc/dnsmasq.leases")
+INTERVAL_S = float(os.environ.get("STATUS_INTERVAL_S", "2"))
+SYS = pathlib.Path(os.environ.get("STATUS_SYS", "/sys"))
+
+# RTL2832U-based dongles (RTL-SDR Blog v3/v4 and generic DVB-T sticks).
+SDR_IDS = {("0bda", "2838"), ("0bda", "2832")}
+# OpenStint's noise floor in dBFS: about -41 is good. Above this, decoding suffers.
+NOISY_DBFS = -30.0
+
+PHASES = {
+    "countdown": "STARTING",
+    "running": "RACING",
+    "finishing": "FINISHING",
+    "finished": "FINISHED",
+    "cancelled": "CANCELLED",
+    "aborted": "ABORTED",
+}
+
+
+@dataclass
+class State:
+    host: str = ""
+    wired_ip: str | None = None
+    wired_link: bool = False
+    internet: bool = False
+    wifi_on: bool = False
+    wifi_up: bool = False
+    ssid: str = ""
+    wifi_clients: int = 0
+    sdr_present: bool = False
+    decoder_active: bool = False
+    portal_active: bool = False
+    app_ok: bool = False
+    decoder: dict = field(default_factory=dict)
+    race: dict | None = None
+
+
+# ── Collecting ──────────────────────────────────────────────────────────────
+
+def _read(path: pathlib.Path | str) -> str:
+    try:
+        return pathlib.Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
+def ipv4(ifname: str) -> str | None:
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "dev", ifname],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if "inet" in parts:
+            return parts[parts.index("inet") + 1].split("/")[0]
+    return None
+
+
+def link_up(ifname: str) -> bool:
+    return _read(SYS / "class/net" / ifname / "carrier") == "1"
+
+
+def has_default_route() -> bool:
+    try:
+        out = subprocess.run(["ip", "-4", "route", "show", "default"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(out.strip())
+
+
+def sdr_present() -> bool:
+    for dev in (SYS / "bus/usb/devices").glob("*"):
+        ids = (_read(dev / "idVendor").lower(), _read(dev / "idProduct").lower())
+        if ids in SDR_IDS:
+            return True
+    return False
+
+
+def unit_active(unit: str) -> bool:
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", unit],
+                              timeout=3).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def install_state(path: str = STATE_FILE) -> dict:
+    out = {}
+    for line in _read(path).splitlines():
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def lease_count(path: str = LEASES) -> int:
+    now = time.time()
+    count = 0
+    for line in _read(path).splitlines():
+        parts = line.split()
+        if parts and parts[0].isdigit() and (int(parts[0]) == 0 or int(parts[0]) > now):
+            count += 1
+    return count
+
+
+def get_json(path: str) -> dict | None:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{APP_PORT}{path}", timeout=2) as r:
+            return json.load(r)
+    except (OSError, ValueError):
+        return None
+
+
+def collect() -> State:
+    st = State(host=socket.gethostname())
+    st.wired_link = link_up(WIRED_IF)
+    st.wired_ip = ipv4(WIRED_IF)
+    st.internet = has_default_route()
+    conf = install_state()
+    st.wifi_on = conf.get("EVENT_WIFI") == "on"
+    st.ssid = conf.get("SSID", "")
+    if st.wifi_on:
+        st.wifi_up = ipv4(WIFI_IF) is not None
+        st.wifi_clients = lease_count() if st.wifi_up else 0
+    st.sdr_present = sdr_present()
+    st.decoder_active = unit_active("openstint.service")
+    st.portal_active = unit_active("race-portal.service")
+    health = get_json("/healthz")
+    st.app_ok = bool(health and health.get("ok"))
+    if st.app_ok:
+        live = get_json("/api/live") or {}
+        st.decoder = live.get("decoder") or {}
+        race = get_json("/api/race/current")
+        st.race = race if race and race.get("phase") else None
+    return st
+
+
+# ── Rendering ───────────────────────────────────────────────────────────────
+
+def problems(st: State) -> list[str]:
+    out = []
+    if not st.sdr_present:
+        out.append("SDR not plugged in (USB)")
+    if not st.decoder_active:
+        out.append("Decoder stopped")
+    elif st.sdr_present and st.app_ok and not st.decoder.get("online"):
+        out.append("Decoder silent: no status lines")
+    noise = st.decoder.get("noise")
+    if st.decoder.get("online") and isinstance(noise, (int, float)) and noise > NOISY_DBFS:
+        out.append(f"Noisy RF: {noise:.0f} dBFS (want -40s)")
+    if not st.app_ok:
+        out.append("App not answering")
+    if not st.portal_active:
+        out.append("Web portal (port 80) stopped")
+    if st.wifi_on and not st.wifi_up:
+        out.append("Event Wi-Fi is down")
+    return out
+
+
+def _clock(ms: int) -> str:
+    s = max(0, ms // 1000)
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def race_lines(race: dict | None) -> list[str]:
+    if not race:
+        return ["Race   none yet"]
+    phase = PHASES.get(race.get("phase", ""), str(race.get("phase", "")).upper())
+    lines = [f"Race   {phase}", f"       {race.get('title') or 'Heat'}"]
+    now = race.get("nowMs") or 0
+    if race.get("phase") == "countdown" and race.get("goAtMs"):
+        lines.append(f"       starts in {_clock(race['goAtMs'] - now)}")
+    elif race.get("phase") == "running" and race.get("timeUpAtMs"):
+        lines.append(f"       {_clock(race['timeUpAtMs'] - now)} left")
+    standings = race.get("standings") or []
+    if standings and race.get("phase") in ("running", "finishing", "finished"):
+        lead = standings[0]
+        name = lead.get("racerName") or lead.get("transponder") or "?"
+        laps = lead.get("laps")
+        tail = f" ({laps} laps)" if laps is not None else ""
+        lines.append(f"       1st {name}{tail}")
+    return lines
+
+
+def render(st: State, width: int = 40) -> list[str]:
+    lines = [f"RC RACE HQ LAP COUNTER  {time.strftime('%H:%M')}", st.host, ""]
+    if st.wired_ip:
+        net = "internet" if st.internet else "no internet"
+        lines.append(f"Wired  {st.wired_ip}  ({net})")
+    elif st.wired_link:
+        lines.append("Wired  cable in, no address")
+    else:
+        lines.append("Wired  OFFLINE (no cable)")
+    if st.wifi_on:
+        ssid = st.ssid or "event Wi-Fi"
+        lines.append(f"Wi-Fi  {ssid}")
+        if st.wifi_up:
+            lines.append(f"       http://race/  {st.wifi_clients} joined")
+        else:
+            lines.append("       DOWN")
+    else:
+        lines.append("Wi-Fi  event Wi-Fi off")
+    lines.append("")
+    lines.extend(race_lines(st.race))
+    lines.append("")
+    found = problems(st)
+    if found:
+        lines.append("PROBLEMS")
+        lines.extend(f" ! {p}" for p in found)
+    else:
+        noise = st.decoder.get("noise")
+        rf = f"  noise {noise:.0f} dBFS" if isinstance(noise, (int, float)) else ""
+        lines.append(f"All OK{rf}")
+    return [line[:width] for line in lines]
+
+
+# ── Drawing ─────────────────────────────────────────────────────────────────
+
+RED, GREEN, BOLD, OFF = "\033[31;1m", "\033[32;1m", "\033[1m", "\033[0m"
+
+
+def paint(lines: list[str]) -> str:
+    out = []
+    for line in lines:
+        if line.startswith(" ! ") or line == "PROBLEMS" or "OFFLINE" in line:
+            out.append(f"{RED}{line}{OFF}")
+        elif line.startswith("All OK"):
+            out.append(f"{GREEN}{line}{OFF}")
+        elif line.startswith("RC RACE HQ"):
+            out.append(f"{BOLD}{line}{OFF}")
+        else:
+            out.append(line)
+    # Home, draw each line clearing its tail, then clear below: no flicker.
+    return "\033[H" + "".join(f"{line}\033[K\n" for line in out) + "\033[J"
+
+
+# ── Graphics (colour LCD / HDMI framebuffer) ──────────────────────────────
+
+# Drawn at 480x320 (the 3.5" LCD) and scaled to other screens. Needs Pillow
+# (python3-pil) and a /dev/fb*; without them the text screen above is used.
+FB_DEV = os.environ.get("STATUS_FB", "/dev/fb0")
+W, H = 480, 320
+FONT_DIR = pathlib.Path(os.environ.get("STATUS_FONT_DIR", "/usr/share/fonts/truetype/dejavu"))
+
+BG, CARD, EDGE = (14, 17, 22), (27, 32, 40), (44, 51, 62)
+TEXT, DIM = (236, 239, 243), (138, 148, 162)
+BRAND = (214, 40, 40)
+OKC, WARN, BAD, INFO = (46, 204, 113), (245, 166, 35), (231, 76, 60), (52, 152, 219)
+
+PHASE_COLOUR = {"RACING": OKC, "STARTING": WARN, "FINISHING": WARN,
+                "FINISHED": INFO, "CANCELLED": DIM, "ABORTED": BAD}
+
+
+def _font(size: int, bold: bool = False, mono: bool = False):
+    from PIL import ImageFont
+    name = "DejaVuSans" + ("Mono" if mono else "") + ("-Bold" if bold else "") + ".ttf"
+    try:
+        return ImageFont.truetype(str(FONT_DIR / name), size)
+    except OSError:
+        return ImageFont.load_default(size)
+
+
+def _fit(draw, text: str, font, width: int) -> str:
+    if draw.textlength(text, font=font) <= width:
+        return text
+    while text and draw.textlength(text + "…", font=font) > width:
+        text = text[:-1]
+    return text + "…"
+
+
+def _dot(draw, x: int, y: int, colour) -> None:
+    draw.ellipse((x, y, x + 10, y + 10), fill=colour)
+
+
+def _card(draw, box, title: str) -> None:
+    draw.rounded_rectangle(box, radius=10, fill=CARD, outline=EDGE)
+    draw.text((box[0] + 12, box[1] + 8), title, font=_font(11, bold=True), fill=DIM)
+
+
+def _noise_bar(draw, x: int, y: int, w: int, noise: float) -> None:
+    """-60..-10 dBFS: green below -35, amber up to -30, red above."""
+    lo, hi = -60.0, -10.0
+
+    def px(v: float) -> int:
+        return x + int((min(max(v, lo), hi) - lo) / (hi - lo) * w)
+
+    draw.rounded_rectangle((x, y, x + w, y + 8), radius=4, fill=EDGE)
+    colour = OKC if noise <= -35 else WARN if noise <= NOISY_DBFS else BAD
+    draw.rounded_rectangle((x, y, max(px(noise), x + 8), y + 8), radius=4, fill=colour)
+    for mark in (-35, NOISY_DBFS):
+        draw.line((px(mark), y - 2, px(mark), y + 10), fill=DIM)
+
+
+def draw_screen(st: State, now: float | None = None):
+    """The whole screen as a 480x320 Pillow image."""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+
+    # Header: brand bar with a checkered-flag edge.
+    d.rectangle((0, 0, W, 44), fill=BRAND)
+    for row in range(4):
+        for col in range(3):
+            if (row + col) % 2 == 0:
+                d.rectangle((col * 11, row * 11, col * 11 + 10, row * 11 + 10), fill=TEXT)
+    d.text((44, 5), "RC RACE HQ", font=_font(19, bold=True), fill=TEXT)
+    d.text((44, 27), _fit(d, f"Lap counter · {st.host}", _font(12), 300), font=_font(12), fill=TEXT)
+    clock = time.strftime("%H:%M", time.localtime(now))
+    d.text((W - 12, 22), clock, font=_font(24, bold=True, mono=True), fill=TEXT, anchor="rm")
+
+    # Network card.
+    _card(d, (8, 52, 236, 182), "NETWORK")
+    big, small = _font(17, bold=True, mono=True), _font(12)
+    if st.wired_ip:
+        _dot(d, 20, 79, OKC if st.internet else WARN)
+        d.text((38, 74), st.wired_ip, font=big, fill=TEXT)
+        d.text((38, 96), "wired · internet" if st.internet else "wired · no internet",
+               font=small, fill=DIM)
+    else:
+        _dot(d, 20, 79, BAD)
+        d.text((38, 74), "OFFLINE", font=big, fill=BAD)
+        d.text((38, 96), "cable in, no address" if st.wired_link else "no cable",
+               font=small, fill=DIM)
+    if st.wifi_on:
+        _dot(d, 20, 127, OKC if st.wifi_up else BAD)
+        d.text((38, 121), _fit(d, st.ssid or "Event Wi-Fi", _font(15, bold=True), 190),
+               font=_font(15, bold=True), fill=TEXT)
+        sub = f"http://race/ · {st.wifi_clients} joined" if st.wifi_up else "Wi-Fi DOWN"
+        d.text((38, 142), sub, font=small, fill=DIM if st.wifi_up else BAD)
+    else:
+        _dot(d, 20, 127, DIM)
+        d.text((38, 121), "Event Wi-Fi off", font=_font(15), fill=DIM)
+
+    # Race card.
+    _card(d, (244, 52, 472, 182), "RACE")
+    race = st.race
+    if not race:
+        d.text((358, 122), "No race yet", font=_font(16), fill=DIM, anchor="mm")
+    else:
+        phase = PHASES.get(race.get("phase", ""), str(race.get("phase", "")).upper())
+        colour = PHASE_COLOUR.get(phase, DIM)
+        pill = _font(11, bold=True)
+        pw = int(d.textlength(phase, font=pill)) + 16
+        d.rounded_rectangle((462 - pw, 57, 462, 75), radius=9, fill=colour)
+        d.text((462 - pw / 2, 66), phase, font=pill, fill=BG, anchor="mm")
+        d.text((256, 80), _fit(d, race.get("title") or "Heat", _font(14, bold=True), 204),
+               font=_font(14, bold=True), fill=TEXT)
+        nowms = race.get("nowMs") or 0
+        clock_txt, label = "", ""
+        if race.get("phase") == "countdown" and race.get("goAtMs"):
+            clock_txt, label = _clock(race["goAtMs"] - nowms), "to start"
+        elif race.get("phase") == "running" and race.get("timeUpAtMs"):
+            clock_txt, label = _clock(race["timeUpAtMs"] - nowms), "left"
+        if clock_txt:
+            d.text((256, 100), clock_txt, font=_font(34, bold=True, mono=True), fill=colour)
+            d.text((256 + d.textlength(clock_txt, font=_font(34, bold=True, mono=True)) + 6, 122),
+                   label, font=small, fill=DIM)
+        standings = race.get("standings") or []
+        if standings and race.get("phase") in ("running", "finishing", "finished"):
+            lead = standings[0]
+            name = lead.get("racerName") or lead.get("transponder") or "?"
+            laps = lead.get("laps")
+            tail = f"  {laps} laps" if laps is not None else ""
+            d.text((256, 152), _fit(d, f"1st {name}{tail}", _font(13, bold=True), 204),
+                   font=_font(13, bold=True), fill=TEXT)
+
+    # Health panel.
+    found = problems(st)
+    box = (8, 190, 472, 312)
+    if found:
+        d.rounded_rectangle(box, radius=10, fill=(58, 20, 20), outline=BAD, width=2)
+        d.text((20, 198), "NEEDS ATTENTION", font=_font(13, bold=True), fill=BAD)
+        shown = found[:4] if len(found) <= 4 else found[:3]
+        for i, msg in enumerate(shown):
+            y = 222 + i * 21
+            _dot(d, 22, y + 4, BAD)
+            d.text((40, y), _fit(d, msg, _font(15), 420), font=_font(15), fill=TEXT)
+        if len(found) > len(shown):
+            d.text((40, 222 + 3 * 21), f"+{len(found) - 3} more", font=_font(13), fill=DIM)
+    else:
+        d.rounded_rectangle(box, radius=10, fill=(18, 48, 32), outline=OKC, width=2)
+        d.text((20, 200), "✓ All OK", font=_font(24, bold=True), fill=OKC)
+        d.text((20, 234), "SDR · decoder · app · portal", font=_font(13), fill=DIM)
+        noise = st.decoder.get("noise")
+        if isinstance(noise, (int, float)):
+            d.text((460, 212), f"{noise:.0f} dBFS", font=_font(18, bold=True, mono=True),
+                   fill=TEXT, anchor="rm")
+            d.text((20, 264), "RF noise", font=_font(12), fill=DIM)
+            _noise_bar(d, 90, 268, 370, float(noise))
+    return img
+
+
+def to_rgb565(img) -> bytes:
+    """Pillow has no RGB565 packer: build the two bytes per pixel with C-speed ops."""
+    from PIL import Image, ImageChops
+    r, g, b = img.split()
+    lo = ImageChops.add(g.point(lambda v: ((v >> 2) & 7) << 5), b.point(lambda v: v >> 3))
+    hi = ImageChops.add(r.point(lambda v: (v >> 3) << 3), g.point(lambda v: v >> 5))
+    return Image.merge("LA", (lo, hi)).tobytes()
+
+
+class Framebuffer:
+    def __init__(self, dev: str = FB_DEV):
+        name = pathlib.Path(dev).name
+        info = SYS / "class/graphics" / name
+        self.width, self.height = (int(v) for v in _read(info / "virtual_size").split(","))
+        self.bpp = int(_read(info / "bits_per_pixel"))
+        self.stride = int(_read(info / "stride") or self.width * self.bpp // 8)
+        if self.bpp not in (16, 32):
+            raise OSError(f"{dev}: {self.bpp} bpp not supported")
+        self.fh = open(dev, "r+b", buffering=0)  # noqa: SIM115 - held for the process
+        self.last = b""
+
+    def show(self, img) -> None:
+        if img.size != (self.width, self.height):
+            from PIL import Image
+            img = img.resize((self.width, self.height), Image.LANCZOS)
+        raw = to_rgb565(img) if self.bpp == 16 else img.convert("RGB").tobytes("raw", "BGRX")
+        if raw == self.last:
+            return
+        self.last = raw
+        row = self.width * self.bpp // 8
+        if self.stride != row:
+            raw = b"".join(raw[i:i + row].ljust(self.stride, b"\0")
+                           for i in range(0, len(raw), row))
+        self.fh.seek(0)
+        self.fh.write(raw)
+
+
+KDSETMODE, KD_TEXT, KD_GRAPHICS = 0x4B3A, 0, 1
+
+
+def _console_mode(mode: int) -> None:
+    """Stop (or restart) the kernel console drawing over our pixels."""
+    import fcntl
+    try:
+        fcntl.ioctl(sys.stdout.fileno(), KDSETMODE, mode)
+    except OSError:
+        pass  # not a VT (e.g. run by hand over SSH)
+
+
+def open_framebuffer() -> Framebuffer | None:
+    if os.environ.get("STATUS_MODE", "auto") == "text":
+        return None
+    try:
+        import PIL  # noqa: F401
+        return Framebuffer()
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+def main() -> int:
+    fb = open_framebuffer()
+    if fb:
+        import signal
+        _console_mode(KD_GRAPHICS)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        try:
+            while True:
+                fb.show(draw_screen(collect()))
+                time.sleep(INTERVAL_S)
+        finally:
+            _console_mode(KD_TEXT)
+    # Text console: no screen blanking, no cursor, start clean.
+    sys.stdout.write("\033[9;0]\033[?25l\033[2J")
+    while True:
+        width = shutil.get_terminal_size((40, 20)).columns
+        try:
+            sys.stdout.write(paint(render(collect(), width)))
+            sys.stdout.flush()
+        except OSError:
+            return 1
+        time.sleep(INTERVAL_S)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
