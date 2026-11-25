@@ -182,3 +182,46 @@ def test_framebuffer_scales_and_pads_32bpp(tmp_path, monkeypatch):
 def test_text_mode_forced(monkeypatch):
     monkeypatch.setenv("STATUS_MODE", "text")
     assert ls.open_framebuffer() is None
+
+
+def _fbs(tmp_path, monkeypatch, **names):
+    for dev, name in names.items():
+        info = tmp_path / "sys/class/graphics" / dev
+        info.mkdir(parents=True)
+        (info / "name").write_text(name)
+    monkeypatch.setattr(ls, "SYS", tmp_path / "sys")
+    monkeypatch.setattr(ls, "FB_DEV", "")
+
+
+def test_find_framebuffer_prefers_spi_lcd(tmp_path, monkeypatch):
+    _fbs(tmp_path, monkeypatch, fb0="vc4drmfb", fb1="fb_ili9486")
+    assert ls.find_framebuffer() == "/dev/fb1"
+
+
+def test_find_framebuffer_hdmi_only(tmp_path, monkeypatch):
+    _fbs(tmp_path, monkeypatch, fb0="vc4drmfb")
+    assert ls.find_framebuffer() == "/dev/fb0"
+
+
+def test_find_framebuffer_none(tmp_path, monkeypatch):
+    _fbs(tmp_path, monkeypatch)
+    assert ls.find_framebuffer() is None
+
+
+def test_find_framebuffer_waits_for_lcd(tmp_path, monkeypatch):
+    _fbs(tmp_path, monkeypatch, fb0="vc4drmfb")
+    slept = []
+
+    def appear(_):
+        slept.append(1)
+        info = tmp_path / "sys/class/graphics/fb1"
+        info.mkdir(parents=True, exist_ok=True)
+        (info / "name").write_text("fb_ili9486")
+
+    assert ls.find_framebuffer(wait_s=30, sleep=appear) == "/dev/fb1"
+    assert slept == [1]
+
+
+def test_find_framebuffer_env_override(monkeypatch):
+    monkeypatch.setattr(ls, "FB_DEV", "/dev/fb7")
+    assert ls.find_framebuffer() == "/dev/fb7"

@@ -33,7 +33,7 @@ Quantities are per kit.
 
 | Qty | Part | Notes |
 |---|---|---|
-| 1 | Raspberry Pi 4 Model B, 2 GB or more | Kit baseline. Pi OS Trixie 64-bit or Ubuntu 24.04 arm64 both work with the installer |
+| 1 | Raspberry Pi 4 Model B, 2 GB or more | Kit baseline. Raspberry Pi OS Lite Trixie 64-bit recommended; Ubuntu 24.04+ arm64 also works with the installer |
 | 1 | USB-C power supply, 5.1 V 3 A (official Pi 4 PSU) | Skip if using a PoE HAT (see optional) |
 | 1 | microSD card, 32 GB, A1/A2 class | Holds the OS, Docker images, SQLite and `.rc4` files |
 | 1 | RTL-SDR Blog V3 dongle | 5 MHz via Q-branch direct sampling (OpenStint switches this on by itself). The V4 also works |
@@ -73,6 +73,7 @@ runs today).
 |---|---|---|
 | 1 | USB-A extension, 15–30 cm (male to female) | Only if the dongle won't fit or runs hot. Try without first: on a test Pi an extension added noise. Use a black USB 2 port either way |
 | 1 | Powered speaker / PA with 3.5 mm input | Announcer. HDMI carries the same audio |
+| 1 | 3.5" SPI LCD, Waveshare or SpotPear "3.5inch RPi LCD (A)" (V3 fine) | Status screen with no monitor: IP, Wi-Fi, race, problems. Install with `--lcd waveshare35a`. Uses GPIO17, so not with the burst-detector HAT |
 | 1 | Raspberry Pi PoE+ HAT + PoE switch/injector | One cable for power + network. **Stacking order with the burst HAT isn't decided yet**, so hold off unless you want to experiment |
 
 ### Not yet, don't order
@@ -302,7 +303,7 @@ Pin numbers in brackets. Grounds marked `⏚`.
 | 2, 4 | 5 V | +5V (LM393, AD8307 via R20) |
 | 3 | GPIO2 / SDA1 | ADS1115 SDA |
 | 5 | GPIO3 / SCL1 | ADS1115 SCL |
-| 11 | GPIO17 | BURST (comparator out) |
+| 11 | GPIO17 | BURST (comparator out). Also the 3.5" LCD's touch line, so not with `--lcd` |
 | 6, 9, 14, 20, 25, 30, 34, 39 | GND | GND |
 
 Every other pin is passed through untouched. GPIO27 (planned for the ADS1115

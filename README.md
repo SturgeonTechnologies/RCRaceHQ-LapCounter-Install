@@ -16,8 +16,9 @@ shared transponder library need an RC Race HQ club to pair with
 
 ## Quick install (one command, on the Pi)
 
-Image the Pi with Raspberry Pi OS Lite (64-bit, Trixie) or Ubuntu 24.04+ arm64,
-plug in Ethernet and the RTL-SDR, then log in as your normal user and run:
+Image the Pi with **Raspberry Pi OS Lite (64-bit, Trixie)**, the recommended
+OS. Ubuntu 24.04+ arm64 works too, but the first install takes longer (OpenStint
+is built from source) and it has more moving parts (netplan, A/B boot). Then plug in Ethernet and the RTL-SDR, then log in as your normal user and run:
 
 ```bash
 curl -fsSL https://www.rcracehq.com/lapcounter/install.sh | sudo bash
@@ -44,6 +45,8 @@ curl -fsSL https://www.rcracehq.com/lapcounter/install.sh \
 | `--passphrase PASS` | open | Event Wi-Fi password (8-63 characters). |
 | `--country CC` | `US` | Wi-Fi country code. |
 | `--no-screen` | status screen on | Leave the console (tty1) as a login prompt instead of the status screen. |
+| `--lcd MODEL` | left as is | Set up a small SPI LCD on the GPIO header: `waveshare35a` (Waveshare / SpotPear 3.5" RPi LCD (A), incl. V3). `none` removes one set up earlier. Reboot once afterwards. See [Small LCD](#small-lcd). |
+| `--lcd-rotate DEG` | `270` | LCD rotation: `0`, `90`, `180` or `270`. |
 
 `install.sh` is plain bash. Re-run it to update or change options; finished
 steps are skipped. Prefer to read it first? `curl -fsSLO …/install.sh`, read
@@ -80,6 +83,47 @@ same information as coloured text.
 It replaces the login prompt on tty1; press Alt+F2 for a login. Logs:
 `journalctl -u lapcounter-status`.
 
+### Small LCD
+
+A 3.5" SPI LCD on the GPIO header makes the Pi show its status with no monitor:
+
+```bash
+curl -fsSL https://www.rcracehq.com/lapcounter/install.sh | sudo bash -s -- --lcd waveshare35a
+sudo reboot
+```
+
+| Model | Screens | Overlay |
+|---|---|---|
+| `waveshare35a` | Waveshare 3.5" RPi LCD (A), SpotPear 3.5" RPi LCD (A) V3, other ILI9486 + XPT2046 "3.5 inch (A)" clones | `waveshare35a` |
+
+What `--lcd` does, on both Raspberry Pi OS and Ubuntu:
+
+- Downloads the overlay from a pinned Waveshare commit and checks its sha256
+  (Raspberry Pi dropped `waveshare35a` from its firmware; Ubuntu never shipped it).
+- Copies it into every overlays folder on the boot partition: `overlays/` on
+  Raspberry Pi OS, `current/` and `new/overlays/` on Ubuntu's A/B boot.
+- Adds a kernel/initramfs hook (`zzz-lapcounter-lcd`) that copies it back after
+  updates, which can rewrite those folders.
+- Adds `dtparam=spi=on` and the overlay line in its own marked `[all]` block at
+  the end of `config.txt`, and comments out any other 3.5" LCD overlay line
+  (`piscreen`, `tft35a`, an older `waveshare35a`). The original is saved once as
+  `config.txt.lapcounter-bak`.
+- The status screen then draws on the LCD. It picks the LCD's framebuffer over
+  HDMI's (on Raspberry Pi OS the LCD is usually `fb1`), waiting up to 30 s at
+  boot for its driver.
+
+Don't run the vendor's `LCD-show` script: it rewrites `config.txt` and turns
+off the graphics driver. If the screen stays **white** after a reboot, the
+overlay didn't load: check `cat /sys/class/graphics/fb*/name` shows `fb_ili9486`
+and that the board sits on pins 1-26 without being shifted a row.
+
+Pins: the LCD uses SPI0 (both chip selects), GPIO24 and 25, and GPIO17 for touch.
+GPIO22 stays free for the RF board's relay. The burst-detector HAT's BURST
+line is also GPIO17, so it can't share a Pi with this LCD.
+
+To add another screen later: add a model to `lcd_profile()` in `install.sh`
+(overlay name, pinned URL, sha256).
+
 ## Hardware
 
 Parts list, loop wiring and an ASCII schematic: [docs/hardware.md](docs/hardware.md).
@@ -91,6 +135,7 @@ Parts list, loop wiring and an ASCII schematic: [docs/hardware.md](docs/hardware
 | `install.sh` | The installer |
 | `files/race-portal` | Port 80 captive portal / proxy to the app (installed to `/usr/local/sbin`) |
 | `files/openstint-learn` | Transponder learning helper (installed to `/usr/local/bin`) |
+| `files/lapcounter-status` | Console / LCD status screen (installed to `/usr/local/sbin`) |
 | `tests/` | pytest for the two helpers |
 | `docs/hardware.md` | Parts list and loop wiring |
 

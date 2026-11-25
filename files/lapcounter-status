@@ -13,8 +13,9 @@ console is on: a small SPI LCD, or HDMI. Every few seconds it redraws:
 It only reads: /sys, `systemctl is-active`, the dnsmasq lease file and the
 app's public endpoints on 127.0.0.1.
 
-On a colour screen (/dev/fb0 plus Pillow) it draws a graphical dashboard;
+On a colour screen (a /dev/fb* plus Pillow) it draws a graphical dashboard;
 otherwise, or with STATUS_MODE=text, it falls back to coloured console text.
+A small SPI LCD (an fbtft "fb_*" framebuffer) wins over HDMI when both exist.
 
 SPDX-License-Identifier: LicenseRef-FSL-1.1-ALv2
 Copyright 2026 Sturgeon Technologies LLC
@@ -279,7 +280,10 @@ def paint(lines: list[str]) -> str:
 
 # Drawn at 480x320 (the 3.5" LCD) and scaled to other screens. Needs Pillow
 # (python3-pil) and a /dev/fb*; without them the text screen above is used.
-FB_DEV = os.environ.get("STATUS_FB", "/dev/fb0")
+FB_DEV = os.environ.get("STATUS_FB", "")  # empty = pick one (see find_framebuffer)
+# With an LCD set up (install.sh --lcd), wait this long at boot for its
+# driver, so HDMI's framebuffer isn't picked just because it came up first.
+LCD_WAIT_S = float(os.environ.get("STATUS_LCD_WAIT", "0") or 0)
 W, H = 480, 320
 FONT_DIR = pathlib.Path(os.environ.get("STATUS_FONT_DIR", "/usr/share/fonts/truetype/dejavu"))
 
@@ -441,7 +445,7 @@ def to_rgb565(img) -> bytes:
 
 
 class Framebuffer:
-    def __init__(self, dev: str = FB_DEV):
+    def __init__(self, dev: str = "/dev/fb0"):
         name = pathlib.Path(dev).name
         info = SYS / "class/graphics" / name
         self.width, self.height = (int(v) for v in _read(info / "virtual_size").split(","))
@@ -480,12 +484,38 @@ def _console_mode(mode: int) -> None:
         pass  # not a VT (e.g. run by hand over SSH)
 
 
+def _framebuffers() -> list[tuple[str, str]]:
+    """(device name, driver name) for each framebuffer, e.g. ("fb1", "fb_ili9486")."""
+    out = []
+    for info in sorted((SYS / "class/graphics").glob("fb[0-9]*")):
+        out.append((info.name, _read(info / "name")))
+    return out
+
+
+def find_framebuffer(wait_s: float = 0.0, sleep=time.sleep) -> str | None:
+    """The screen to draw on: STATUS_FB if set, else an SPI LCD (fbtft drivers
+    are named "fb_*"), else the first framebuffer (HDMI). With wait_s, keep
+    looking for the LCD that long before settling for HDMI."""
+    if FB_DEV:
+        return FB_DEV
+    deadline = time.monotonic() + wait_s
+    while True:
+        fbs = _framebuffers()
+        lcd = [dev for dev, name in fbs if name.startswith("fb_")]
+        if lcd:
+            return f"/dev/{lcd[0]}"
+        if time.monotonic() >= deadline:
+            return f"/dev/{fbs[0][0]}" if fbs else None
+        sleep(1)
+
+
 def open_framebuffer() -> Framebuffer | None:
     if os.environ.get("STATUS_MODE", "auto") == "text":
         return None
     try:
         import PIL  # noqa: F401
-        return Framebuffer()
+        dev = find_framebuffer(LCD_WAIT_S)
+        return Framebuffer(dev) if dev else None
     except (ImportError, OSError, ValueError):
         return None
 
