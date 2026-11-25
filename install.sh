@@ -16,7 +16,8 @@
 #                  at http://race/  (skip with --no-ap)
 #   5. Docker      Docker Engine + compose plugin from Docker's signed repo
 #   6. App         lapd + web + syncd containers, pinned to one image build
-#   7. Screen      status screen on the console (skip with --no-screen)
+#   7. Screen      status screen on the console (skip with --no-screen), and
+#                  a small SPI LCD's driver with --lcd
 #   8. Check       portal on :80, app behind it (Pi-only :8080), decoder running
 #
 # Safe to run again: re-running is also how you update or change options.
@@ -35,6 +36,13 @@
 #   --no-screen          Don't put the status screen on the console (tty1).
 #                        Normally tty1 shows the wired IP, the event Wi-Fi, the
 #                        race on track and any problems (SDR unplugged, ...).
+#   --lcd MODEL          Set up a small SPI LCD on the GPIO header. Models:
+#                          waveshare35a  Waveshare / SpotPear 3.5" RPi LCD (A),
+#                                        incl. V3 (ILI9486 + XPT2046 touch)
+#                          none          remove an LCD set up earlier
+#                        Leave it off to keep whatever is set up now. Needs a
+#                        reboot the first time.
+#   --lcd-rotate DEG     LCD rotation: 0, 90, 180 or 270 (default: 270)
 #   -h, --help           Show this help.
 #
 # Pass options through the pipe with "bash -s --":
@@ -100,6 +108,28 @@ readonly AP_HOSTNAME="race"
 readonly AP_DOMAIN="lan"
 readonly PORTAL_PORT=80
 
+# ── Small SPI LCD (--lcd) ────────────────────────────────────────────────────
+# Overlay files are downloaded from a pinned commit and checked by sha256.
+# Raspberry Pi dropped waveshare35a from its firmware, and Ubuntu never had it.
+readonly LCD_SHARE_DIR="/usr/local/share/lapcounter-lcd"
+readonly LCD_HOOK_NAME="zzz-lapcounter-lcd"
+readonly LCD_BEGIN="# >>> RC Race HQ lap counter LCD (install.sh manages this block) >>>"
+readonly LCD_END="# <<< RC Race HQ lap counter LCD <<<"
+readonly LCD_WAIT_S=30
+
+# lcd_profile MODEL: sets LCD_OVERLAY, LCD_URL, LCD_SHA256. Add screens here.
+lcd_profile() {
+    case $1 in
+        waveshare35a)
+            LCD_OVERLAY=waveshare35a
+            LCD_URL="https://raw.githubusercontent.com/waveshare/LCD-show/baba588993fcec7abaaf0b2167303086d42f1057/waveshare35a-overlay.dtb"
+            LCD_SHA256="4e879f464dd97387282e68de9ab66b9cc85627fb0b02618ca44cc0a94644ee7d"
+            ;;
+        *) return 1 ;;
+    esac
+}
+readonly LCD_MODELS="waveshare35a"
+
 # ── Defaults for the options ─────────────────────────────────────────────────
 TAG="latest"
 WITH_AP=1
@@ -108,6 +138,9 @@ NEW_HOSTNAME=""
 AP_SSID="RC Race Event"
 AP_PASSPHRASE=""
 AP_COUNTRY="US"
+
+LCD_MODEL=""          # "" = leave as is, none = remove, else a model below
+LCD_ROTATE=270
 
 readonly LOG_FILE="/var/log/lapcounter-install.log"
 readonly STATE_FILE="/etc/lapcounter-install.conf"
@@ -202,6 +235,8 @@ parse_args() {
             --ssid)        AP_SSID=${2:?--ssid needs a value}; shift ;;
             --passphrase)  AP_PASSPHRASE=${2:?--passphrase needs a value}; shift ;;
             --country)     AP_COUNTRY=${2:?--country needs a value}; shift ;;
+            --lcd)         LCD_MODEL=${2:?--lcd needs a model (see --help)}; shift ;;
+            --lcd-rotate)  LCD_ROTATE=${2:?--lcd-rotate needs 0, 90, 180 or 270}; shift ;;
             -*)            die "Unknown option: $1 (see --help)" ;;
             *)
                 [[ $tag_set -eq 0 ]] || die "Only one image tag, please (got '$TAG' and '$1')"
@@ -223,6 +258,9 @@ parse_args() {
     [[ -z $AP_PASSPHRASE || ( ${#AP_PASSPHRASE} -ge 8 && ${#AP_PASSPHRASE} -le 63 ) ]] \
         || die "--passphrase must be 8-63 characters (or leave it off for an open network)"
     [[ ${#AP_SSID} -ge 1 && ${#AP_SSID} -le 32 ]] || die "--ssid must be 1-32 characters"
+    [[ -z $LCD_MODEL || $LCD_MODEL == none ]] || lcd_profile "$LCD_MODEL" \
+        || die "--lcd '$LCD_MODEL' isn't a known screen. Known: $LCD_MODELS (or none)"
+    [[ $LCD_ROTATE =~ ^(0|90|180|270)$ ]] || die "--lcd-rotate must be 0, 90, 180 or 270"
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1017,6 +1055,134 @@ EOF
 #  7. Status screen
 # ════════════════════════════════════════════════════════════════════════════
 
+# ── Small SPI LCD (--lcd) ───────────────────────────────────────────────────
+# Both OSes read /boot/firmware/config.txt. Where the overlay file goes differs:
+#   Raspberry Pi OS  /boot/firmware/overlays/
+#   Ubuntu           /boot/firmware/current/overlays/ (A/B boot; a kernel
+#                    update fills new/ and then swaps it in)
+# So the file is kept in LCD_SHARE_DIR and copied into every overlays folder
+# that exists, now and by a hook after each kernel/initramfs update.
+
+LCD_REBOOT=0
+
+lcd_boot_dir() {
+    if [[ -f /boot/firmware/config.txt ]]; then echo /boot/firmware
+    elif [[ -f /boot/config.txt ]]; then echo /boot
+    else return 1
+    fi
+}
+
+# Print the config.txt with our block removed and any other line that loads
+# a 3.5" LCD overlay commented out (only one may own the SPI bus). With $2 set,
+# append our block (under [all], so a [pi4]/[cm4] section can't hide it).
+lcd_config_text() {
+    local config=$1 block=${2:-}
+    awk -v begin="$LCD_BEGIN" -v end="$LCD_END" '
+        $0 == begin { skip = 1; next }
+        $0 == end   { skip = 0; next }
+        skip        { next }
+        /^[[:space:]]*dtoverlay=(waveshare35[a-z]*|piscreen|tft35a)([,:].*)?[[:space:]]*$/ {
+            print "#" $0 "   # disabled by RC Race HQ install.sh (--lcd)"; next
+        }
+        { print }
+    ' "$config"
+    [[ -z $block ]] || printf '%s\n' "$block"
+}
+
+lcd_overlay_dirs() {
+    local boot=$1 d
+    for d in "$boot/current/overlays" "$boot/new/overlays" "$boot/overlays"; do
+        if [[ -d $d ]]; then echo "$d"; fi
+    done
+    return 0
+}
+
+remove_lcd() {
+    local boot config
+    boot=$(lcd_boot_dir) || return 0
+    config="$boot/config.txt"
+    if grep -qxF "$LCD_BEGIN" "$config"; then
+        lcd_config_text "$config" | write_file "$config" 0755 && LCD_REBOOT=1 || true
+    fi
+    if [[ -d $LCD_SHARE_DIR ]]; then
+        local f d
+        for f in "$LCD_SHARE_DIR"/*.dtbo; do
+            [[ -f $f ]] || continue
+            while read -r d; do rm -f "$d/$(basename "$f")"; done < <(lcd_overlay_dirs "$boot")
+        done
+        rm -rf "$LCD_SHARE_DIR"
+    fi
+    rm -f "/etc/kernel/postinst.d/$LCD_HOOK_NAME" "/etc/initramfs/post-update.d/$LCD_HOOK_NAME"
+    ok "LCD removed$([[ $LCD_REBOOT -eq 1 ]] && echo '; reboot to finish')"
+}
+
+setup_lcd() {
+    case $LCD_MODEL in
+        "")   grep -qsxF "$LCD_BEGIN" "$(lcd_boot_dir 2>/dev/null)/config.txt" \
+                  && info "LCD: keeping the one set up earlier (--lcd none removes it)"
+              return 0 ;;
+        none) remove_lcd; return 0 ;;
+    esac
+
+    lcd_profile "$LCD_MODEL"
+    local boot config tmp dtbo
+    boot=$(lcd_boot_dir) || die "No config.txt in /boot/firmware or /boot; is this a Raspberry Pi image?"
+    config="$boot/config.txt"
+
+    # 1. The overlay file, checked.
+    dtbo="$LCD_SHARE_DIR/${LCD_OVERLAY}.dtbo"
+    if ! { [[ -f $dtbo ]] && echo "$LCD_SHA256  $dtbo" | sha256sum -c --status; }; then
+        tmp=$(mktemp)
+        curl -fsSL --retry 3 --max-time 60 "$LCD_URL" -o "$tmp" \
+            || { rm -f "$tmp"; die "Couldn't download the $LCD_MODEL overlay from $LCD_URL"; }
+        echo "$LCD_SHA256  $tmp" | sha256sum -c --status \
+            || { rm -f "$tmp"; die "The $LCD_MODEL overlay download doesn't match its checksum; not installing it."; }
+        install -D -o root -g root -m 0644 "$tmp" "$dtbo"
+        rm -f "$tmp"
+    fi
+
+    # 2. Copy it into every overlays folder, now and after kernel updates.
+    write_file "/etc/kernel/postinst.d/$LCD_HOOK_NAME" 0755 <<EOF || true
+#!/bin/sh
+# Managed by RC Race HQ install.sh (--lcd). Kernel and firmware updates can
+# rewrite the boot partition's overlays folder; put the LCD overlay back.
+for f in ${LCD_SHARE_DIR}/*.dtbo; do
+    [ -f "\$f" ] || continue
+    for d in ${boot}/current/overlays ${boot}/new/overlays ${boot}/overlays; do
+        [ -d "\$d" ] && cp -f "\$f" "\$d/"
+    done
+done
+exit 0
+EOF
+    if [[ -d /etc/initramfs/post-update.d ]]; then
+        install -o root -g root -m 0755 "/etc/kernel/postinst.d/$LCD_HOOK_NAME" \
+            "/etc/initramfs/post-update.d/$LCD_HOOK_NAME"
+    fi
+    local dirs d
+    dirs=$(lcd_overlay_dirs "$boot")
+    [[ -n $dirs ]] || die "No overlays folder under $boot (looked for current/, new/ and overlays/)."
+    while read -r d; do
+        cmp -s "$dtbo" "$d/${LCD_OVERLAY}.dtbo" || { cp -f "$dtbo" "$d/"; LCD_REBOOT=1; }
+    done <<<"$dirs"
+
+    # 3. config.txt: SPI on and the overlay, in our own [all] block at the end.
+    local block
+    block=$(printf '%s\n[all]\ndtparam=spi=on\ndtoverlay=%s,rotate=%s\n%s' \
+        "$LCD_BEGIN" "$LCD_OVERLAY" "$LCD_ROTATE" "$LCD_END")
+    # Keep the original once, before the first change.
+    [[ -f $config.lapcounter-bak ]] || cp -p "$config" "$config.lapcounter-bak"
+    if lcd_config_text "$config" "$block" | write_file "$config" 0755; then
+        LCD_REBOOT=1
+    fi
+
+    if [[ $LCD_REBOOT -eq 0 ]] && grep -qs '^fb_' /sys/class/graphics/fb*/name; then
+        ok "LCD $LCD_MODEL (rotate $LCD_ROTATE) is on"
+    else
+        LCD_REBOOT=1
+        ok "LCD $LCD_MODEL (rotate $LCD_ROTATE) set up; reboot to turn it on"
+    fi
+}
+
 # The console (tty1), so an attached LCD or HDMI screen shows the wired
 # IP, the event Wi-Fi, the race on track and any problems. tty1 has no login
 # prompt while it runs; Alt+F2 still gives one.
@@ -1032,6 +1198,11 @@ setup_status_screen() {
         info "Status screen skipped (--no-screen)"
         return 0
     fi
+
+    # With an LCD set up, give its driver time to load at boot so the
+    # dashboard lands on the LCD and not on HDMI.
+    local lcd_wait=0
+    grep -qsxF "$LCD_BEGIN" "$(lcd_boot_dir 2>/dev/null)/config.txt" && lcd_wait=$LCD_WAIT_S
 
     # Pillow + fonts draw the colour dashboard; without a framebuffer the
     # script falls back to coloured console text.
@@ -1055,6 +1226,7 @@ Environment=STATUS_APP_PORT=${APP_PORT}
 Environment=STATUS_WIRED_IF=${WIRED_IF}
 Environment=STATUS_WIFI_IF=${WIFI_IF}
 Environment=STATUS_STATE_FILE=${STATE_FILE}
+Environment=STATUS_LCD_WAIT=${lcd_wait}
 ExecStart=/usr/bin/python3 -I /usr/local/sbin/lapcounter-status
 StandardInput=null
 StandardOutput=tty
@@ -1112,6 +1284,12 @@ check_result() {
         failed=1
     fi
 
+    local lcd_state=none boot
+    if boot=$(lcd_boot_dir) && grep -qsxF "$LCD_BEGIN" "$boot/config.txt"; then
+        lcd_state=$(awk -v b="$LCD_BEGIN" -v e="$LCD_END" \
+            '$0 == b {in_ = 1} $0 == e {in_ = 0} in_ && sub(/^dtoverlay=/, "") {print}' "$boot/config.txt")
+    fi
+
     write_file "$STATE_FILE" 0644 <<EOF || true
 # Written by RC Race HQ install.sh on $(date -Is). For reference only.
 IMAGE=${IMAGE_REF}
@@ -1119,6 +1297,7 @@ REQUESTED_TAG=${TAG}
 EVENT_WIFI=$([[ $WITH_AP -eq 1 ]] && echo on || echo off)
 SSID=${AP_SSID}
 INSTALL_REF=${INSTALL_REF}
+LCD=${lcd_state}
 EOF
     return $failed
 }
@@ -1141,6 +1320,9 @@ print_summary() {
     printf '  App logs:     cd %s && sudo docker compose logs -f\n' "$APP_DIR"
     printf '  Update:       run the installer again (same command) for the newest build\n'
     printf '\n  Log out and back in once so %s can edit learned transponder files.\n' "$TARGET_USER"
+    if [[ $LCD_REBOOT -eq 1 ]]; then
+        printf '\n  %sReboot to finish the LCD:%s  sudo reboot\n' "$C_BOLD$C_YELLOW" "$C_OFF"
+    fi
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1174,7 +1356,8 @@ main() {
     step "Lap counter app"
     setup_app
 
-    step "Status screen"
+    step "Screen"
+    setup_lcd
     setup_status_screen
 
     step "Check"
