@@ -1017,7 +1017,7 @@ EOF
 #  7. Status screen
 # ════════════════════════════════════════════════════════════════════════════
 
-# The text console (tty1), so an attached LCD or HDMI screen shows the wired
+# The console (tty1), so an attached LCD or HDMI screen shows the wired
 # IP, the event Wi-Fi, the race on track and any problems. tty1 has no login
 # prompt while it runs; Alt+F2 still gives one.
 setup_status_screen() {
@@ -1032,6 +1032,10 @@ setup_status_screen() {
         info "Status screen skipped (--no-screen)"
         return 0
     fi
+
+    # Pillow + fonts draw the colour dashboard; without a framebuffer the
+    # script falls back to coloured console text.
+    apt_install python3-pil fonts-dejavu-core
 
     local script
     script=$(mktemp)

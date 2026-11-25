@@ -109,3 +109,76 @@ def test_lease_count(tmp_path):
 def test_paint_marks_problems_red():
     out = ls.paint([" ! SDR not plugged in (USB)", "All OK"])
     assert ls.RED in out and ls.GREEN in out
+
+
+# ── Graphics ────────────────────────────────────────────────────────────────
+
+import pytest  # noqa: E402
+
+PIL = pytest.importorskip("PIL")
+
+
+RACING = {"phase": "running", "title": "Stock Rock Crawlers Q2", "nowMs": 0,
+          "timeUpAtMs": 185000, "standings": [{"racerName": "Riley Schuit", "laps": 7}]}
+
+
+@pytest.mark.parametrize("st", [
+    healthy(),
+    healthy(race=RACING),
+    healthy(sdr_present=False, decoder={"online": False}, wired_ip=None),
+    healthy(decoder={"online": True, "noise": -24.0}),
+    healthy(app_ok=False, portal_active=False, sdr_present=False, decoder_active=False,
+            wifi_up=False, host="a-very-long-hostname-that-will-not-fit-the-header"),
+])
+def test_draw_screen_is_lcd_sized(st):
+    img = ls.draw_screen(st, now=0)
+    assert img.size == (480, 320)
+    assert img.mode == "RGB"
+
+
+def test_problems_panel_is_red_and_ok_panel_green():
+    ok = ls.draw_screen(healthy(), now=0).getpixel((240, 300))
+    bad = ls.draw_screen(healthy(sdr_present=False), now=0).getpixel((240, 300))
+    assert ok[1] > ok[0]
+    assert bad[0] > bad[1]
+
+
+def test_rgb565_little_endian():
+    from PIL import Image
+    px = [ls.to_rgb565(Image.new("RGB", (1, 1), c)).hex()
+          for c in ((255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255))]
+    assert px == ["00f8", "e007", "1f00", "ffff"]
+
+
+def _fake_fb(tmp_path, monkeypatch, size="480,320", bpp="16", stride="960"):
+    info = tmp_path / "sys/class/graphics/fb0"
+    info.mkdir(parents=True)
+    (info / "virtual_size").write_text(size)
+    (info / "bits_per_pixel").write_text(bpp)
+    (info / "stride").write_text(stride)
+    dev = tmp_path / "fb0"
+    dev.write_bytes(b"")
+    monkeypatch.setattr(ls, "SYS", tmp_path / "sys")
+    return dev
+
+
+def test_framebuffer_writes_whole_frame_once(tmp_path, monkeypatch):
+    dev = _fake_fb(tmp_path, monkeypatch)
+    fb = ls.Framebuffer(str(dev))
+    img = ls.draw_screen(healthy(), now=0)
+    fb.show(img)
+    assert dev.stat().st_size == 480 * 320 * 2
+    dev.write_bytes(b"")
+    fb.show(img)  # unchanged frame: nothing written
+    assert dev.stat().st_size == 0
+
+
+def test_framebuffer_scales_and_pads_32bpp(tmp_path, monkeypatch):
+    dev = _fake_fb(tmp_path, monkeypatch, size="800,480", bpp="32", stride="3328")
+    ls.Framebuffer(str(dev)).show(ls.draw_screen(healthy(), now=0))
+    assert dev.stat().st_size == 3328 * 480
+
+
+def test_text_mode_forced(monkeypatch):
+    monkeypatch.setenv("STATUS_MODE", "text")
+    assert ls.open_framebuffer() is None

@@ -68,6 +68,15 @@ set up) shows a status page that refreshes every 2 seconds:
 - **Problems** in red: SDR not plugged in, decoder stopped or silent, noisy
   RF (noise floor above -30 dBFS), app or portal not answering, Wi-Fi down
 
+On a colour screen it draws a dashboard: a header with the clock, Network and
+Race cards (the race clock in big digits, coloured by phase), and a bottom
+panel that is green with an RF noise meter when all is well, or red with the
+problems listed. It's laid out for a 480x320 LCD and scaled to bigger screens.
+Without a framebuffer, or with `STATUS_MODE=text` in the unit, it shows the
+same information as coloured text.
+
+![Status screen: all OK, SDR unplugged, noisy RF](docs/status-screen.png)
+
 It replaces the login prompt on tty1; press Alt+F2 for a login. Logs:
 `journalctl -u lapcounter-status`.
 
