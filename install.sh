@@ -1047,6 +1047,20 @@ resolve_tag() {
     ok "Image ${IMAGE_REF}$([[ $TAG == latest ]] && echo '  (latest today)')"
 }
 
+# True if this Pi has sound devices and the image build has lapcounter.pa.
+# Pulls the image so the check (and the compose start after it) use it.
+pa_supported() {
+    if [[ ! -d /dev/snd ]] || ! ls /dev/snd/pcmC* >/dev/null 2>&1; then
+        warn "No sound devices (/dev/snd): the Pi's audio jack is off. Race audio still plays in a browser."
+        return 1
+    fi
+    docker pull -q "$IMAGE_REF" >/dev/null || return 1
+    if ! docker run --rm --network none --entrypoint python "$IMAGE_REF" -c 'import lapcounter.pa' >/dev/null 2>&1; then
+        info "This build has no Pi audio jack support yet; race audio plays in a browser."
+        return 1
+    fi
+}
+
 setup_app() {
     resolve_tag
 
@@ -1066,6 +1080,32 @@ EOF
     [[ $(( 8#$(stat -c %a "$RC4_DIR") & 8#020 )) -ne 0 ]] || die "$RC4_DIR isn't group-writable."
     local rc4_gid
     rc4_gid=$(stat -c %g "$RC4_DIR")
+
+    # The Pi's audio jack (race audio page -> "Also play on the Pi's audio
+    # jack"): a pa service with the sound devices, if this Pi has sound and
+    # this build has pa (older builds don't).
+    local pa_service=""
+    if pa_supported; then
+        local audio_gid
+        audio_gid=$(getent group audio | cut -d: -f3)
+        pa_service=$(cat <<PA
+  # Plays race audio on the 3.5 mm jack and HDMI once it's switched on.
+  pa:
+    image: "${IMAGE_REF}"
+    network_mode: host
+    restart: unless-stopped
+    command: ["python", "-m", "lapcounter.pa"]
+    healthcheck:
+      disable: true
+    devices: ["/dev/snd:/dev/snd"]
+    group_add: ["${audio_gid:-29}"]
+    environment:
+      LAPCOUNTER_DB: ${APP_DATA_DIR}/lapcounter.db
+    volumes:
+      - ${APP_DATA_DIR}:${APP_DATA_DIR}
+PA
+)
+    fi
 
     write_file "${APP_DIR}/compose.yaml" 0644 <<EOF || true
 # Managed by RC Race HQ install.sh (re-run it to change the image).
@@ -1116,7 +1156,9 @@ services:
     volumes:
       - ${APP_DATA_DIR}:${APP_DATA_DIR}
       - ${RC4_DIR}:${RC4_DIR}:ro
+${pa_service}
 EOF
+    if [[ -n $pa_service ]]; then ok "Pi audio jack ready (turn it on from the race audio page)"; fi
 
     info "Pulling and starting the app (first pull takes a few minutes)..."
     ( cd "$APP_DIR" && docker compose up -d --pull missing --remove-orphans --wait --wait-timeout 180 >/dev/null )

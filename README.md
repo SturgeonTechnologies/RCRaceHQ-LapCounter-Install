@@ -161,6 +161,7 @@ Parts list, loop wiring and an ASCII schematic: [docs/hardware.md](docs/hardware
 | OpenStint decoder | `openstint.service` | ZeroMQ PUB :5556 | `/var/lib/openstint/*.rc4` |
 | lapd | container `lapcounter-lapd-1` | reads :5556 | `/var/lib/lapcounter/lapcounter.db` |
 | web | container `lapcounter-web-1` (gunicorn) | 127.0.0.1:8080 (Pi only; use :80) | same DB |
+| pa (Pi audio jack) | container `lapcounter-pa-1`, only if the Pi has sound and the build has it | — | plays race audio on the 3.5 mm jack + HDMI when switched on from Admin → Race audio |
 | Event hotspot | NetworkManager `race-hotspot`, `race-portal-firewall.service` | — | — |
 | Captive portal | `race-portal.service` | :80 | serves the app at `http://race/` and `http://<pi>.local/` |
 | DHCP/DNS | `dnsmasq` (`/etc/dnsmasq.d/race-dns.conf`) | 53, 67 on `wlan0` | |
