@@ -225,3 +225,59 @@ def test_find_framebuffer_waits_for_lcd(tmp_path, monkeypatch):
 def test_find_framebuffer_env_override(monkeypatch):
     monkeypatch.setattr(ls, "FB_DEV", "/dev/fb7")
     assert ls.find_framebuffer() == "/dev/fb7"
+
+
+# ── Both screens: LCD dashboard + HDMI race view ────────────────────────────
+
+def test_find_screens_lcd_and_hdmi(tmp_path, monkeypatch):
+    _fbs(tmp_path, monkeypatch, fb0="vc4drmfb", fb1="fb_ili9486")
+    assert ls.find_screens() == [("/dev/fb0", "hdmi"), ("/dev/fb1", "lcd")]
+
+
+def test_find_screens_waits_for_lcd(tmp_path, monkeypatch):
+    _fbs(tmp_path, monkeypatch, fb0="vc4drmfb")
+
+    def appear(_):
+        info = tmp_path / "sys/class/graphics/fb1"
+        info.mkdir(parents=True, exist_ok=True)
+        (info / "name").write_text("fb_ili9486")
+
+    assert [k for _, k in ls.find_screens(wait_s=30, sleep=appear)] == ["hdmi", "lcd"]
+
+
+def test_find_screens_env_override(tmp_path, monkeypatch):
+    _fbs(tmp_path, monkeypatch, fb0="vc4drmfb", fb1="fb_ili9486")
+    monkeypatch.setattr(ls, "FB_DEV", "/dev/fb1")
+    assert ls.find_screens() == [("/dev/fb1", "lcd")]
+
+
+TWELVE = {"phase": "running", "title": "2WD Buggy A-Main", "nowMs": 0, "timeUpAtMs": 300000,
+          "standings": [{"racerName": f"Racer {i}", "place": i, "laps": 20 - i,
+                         "totalMs": 300000 + i * 900, "lastLapMs": 15000 + i * 10,
+                         "bestLapMs": 14500 + i * 10} for i in range(1, 14)]}
+
+
+@pytest.mark.parametrize("size", [(1280, 720), (1920, 1080), (1024, 768)])
+@pytest.mark.parametrize("st", [
+    healthy(),
+    healthy(race=TWELVE),
+    healthy(race={"phase": "countdown", "title": "Q1", "nowMs": 0, "goAtMs": 15000,
+                  "standings": [{"racerName": "A", "grid": 1}]}),
+    healthy(sdr_present=False, wired_ip=None, decoder={"online": False}),
+])
+def test_draw_hdmi_any_size(st, size):
+    assert ls.draw_hdmi(st, *size, now=0).size == size
+
+
+def test_status_strip_flags_problems():
+    ok = ls.status_strip(healthy())
+    assert ok[-1] == ("All OK", ls.OKC)
+    bad = ls.status_strip(healthy(sdr_present=False))
+    assert bad[-1][1] == ls.BAD and "SDR not plugged in" in bad[-1][0]
+
+
+def test_laptime_formats():
+    assert ls._laptime(14523) == "14.523"
+    assert ls._laptime(75250) == "1:15.250"
+    assert ls._laptime(None) == "–"
+    assert ls._total(305400) == "5:05.4"

@@ -108,9 +108,18 @@ What `--lcd` does, on both Raspberry Pi OS and Ubuntu:
   the end of `config.txt`, and comments out any other 3.5" LCD overlay line
   (`piscreen`, `tft35a`, an older `waveshare35a`). The original is saved once as
   `config.txt.lapcounter-bak`.
-- The status screen then draws on the LCD. It picks the LCD's framebuffer over
-  HDMI's (on Raspberry Pi OS the LCD is usually `fb1`), waiting up to 30 s at
-  boot for its driver.
+- The status screen then draws on the LCD, waiting up to 30 s at boot for its
+  driver. On Raspberry Pi OS the LCD is usually `fb1` and HDMI `fb0`.
+
+**LCD and HDMI together.** When both are connected, each gets its own layout:
+the LCD keeps the status dashboard, and HDMI (a TV or monitor at the driver
+stand) shows the race big: heat name, phase, race clock and the standings for
+up to 12 racers (position, laps, total time, last lap, best lap, with the
+fastest lap in green). Network, Wi-Fi, RF noise and any problems sit in one
+thin strip along the bottom, which turns red when something needs attention.
+HDMI needs the KMS graphics driver: keep `dtoverlay=vc4-kms-v3d` in
+`config.txt` (don't comment it out for the LCD). `STATUS_FB=/dev/fbN` in the
+service limits it to one screen.
 
 Don't run the vendor's `LCD-show` script: it rewrites `config.txt` and turns
 off the graphics driver. If the screen stays **white** after a reboot, the

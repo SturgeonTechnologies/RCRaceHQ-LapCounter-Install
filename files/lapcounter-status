@@ -15,7 +15,10 @@ app's public endpoints on 127.0.0.1.
 
 On a colour screen (a /dev/fb* plus Pillow) it draws a graphical dashboard;
 otherwise, or with STATUS_MODE=text, it falls back to coloured console text.
-A small SPI LCD (an fbtft "fb_*" framebuffer) wins over HDMI when both exist.
+With both a small SPI LCD (an fbtft "fb_*" framebuffer) and HDMI, each gets
+its own layout: the LCD keeps the full status dashboard, and HDMI shows the
+race big (standings for the whole heat) with network and health in a thin
+strip along the bottom.
 
 SPDX-License-Identifier: LicenseRef-FSL-1.1-ALv2
 Copyright 2026 Sturgeon Technologies LLC
@@ -435,6 +438,152 @@ def draw_screen(st: State, now: float | None = None):
     return img
 
 
+# ── HDMI: race first, everything else in a strip along the bottom ───────────
+
+def _laptime(ms) -> str:
+    if not isinstance(ms, (int, float)) or ms <= 0:
+        return "–"
+    return f"{ms / 1000:.3f}" if ms < 60000 else f"{int(ms // 60000)}:{ms % 60000 / 1000:06.3f}"
+
+
+def _total(ms) -> str:
+    if not isinstance(ms, (int, float)) or ms <= 0:
+        return "–"
+    s = ms / 1000
+    return f"{int(s // 60)}:{s % 60:04.1f}"
+
+
+def status_strip(st: State) -> list[tuple[str, tuple]]:
+    """The bottom strip as (text, colour) pieces: network, Wi-Fi, RF, health."""
+    if st.wired_ip:
+        parts = [(st.wired_ip + ("" if st.internet else " (no internet)"),
+                  DIM if st.internet else WARN)]
+    else:
+        parts = [("Wired OFFLINE", BAD)]
+    if st.wifi_on:
+        parts.append((f"{st.ssid or 'Event Wi-Fi'} · {st.wifi_clients} joined" if st.wifi_up
+                      else "Event Wi-Fi DOWN", DIM if st.wifi_up else BAD))
+    noise = st.decoder.get("noise")
+    if isinstance(noise, (int, float)):
+        parts.append((f"RF {noise:.0f} dBFS", DIM if noise <= NOISY_DBFS else WARN))
+    found = problems(st)
+    parts.append(("! " + " · ".join(found), BAD) if found else ("All OK", OKC))
+    return parts
+
+
+def draw_hdmi(st: State, w: int = 1280, h: int = 720, now: float | None = None):
+    """HDMI layout at the screen's own size: heat, clock and full standings."""
+    from PIL import Image, ImageDraw
+    k = h / 720
+    px = lambda v: int(v * k)  # noqa: E731
+    img = Image.new("RGB", (w, h), BG)
+    d = ImageDraw.Draw(img)
+
+    # Header: flag, heat title, phase, race clock.
+    top = px(96)
+    d.rectangle((0, 0, w, top), fill=BRAND)
+    sq = px(24)
+    for row in range(4):
+        for col in range(2):
+            if (row + col) % 2 == 0:
+                d.rectangle((col * sq, row * sq, col * sq + sq - 1, row * sq + sq - 1), fill=TEXT)
+    race = st.race
+    title = (race or {}).get("title") or ("No race on track" if not race else "Heat")
+    phase = PHASES.get((race or {}).get("phase", ""), "")
+    colour = PHASE_COLOUR.get(phase, DIM)
+    clock_txt, label = "", ""
+    if race:
+        nowms = race.get("nowMs") or 0
+        if race.get("phase") == "countdown" and race.get("goAtMs"):
+            clock_txt, label = _clock(race["goAtMs"] - nowms), "TO START"
+        elif race.get("phase") == "running" and race.get("timeUpAtMs"):
+            clock_txt, label = _clock(race["timeUpAtMs"] - nowms), "LEFT"
+    big = _font(px(64), bold=True, mono=True)
+    right = w - px(24)
+    if clock_txt:
+        d.text((right, top // 2), clock_txt, font=big, fill=TEXT, anchor="rm")
+        right -= int(d.textlength(clock_txt, font=big)) + px(12)
+        d.text((right, top // 2 + px(18)), label, font=_font(px(18), bold=True), fill=TEXT,
+               anchor="rs")
+        right -= int(d.textlength(label, font=_font(px(18), bold=True))) + px(24)
+    else:
+        d.text((right, top // 2), time.strftime("%H:%M", time.localtime(now)),
+               font=_font(px(40), bold=True, mono=True), fill=TEXT, anchor="rm")
+        right -= px(150)
+    x0 = 2 * sq + px(24)
+    if phase:
+        pill = _font(px(22), bold=True)
+        pw = int(d.textlength(phase, font=pill)) + px(28)
+        d.rounded_rectangle((x0, top // 2 - px(18), x0 + pw, top // 2 + px(18)),
+                            radius=px(18), fill=colour)
+        d.text((x0 + pw / 2, top // 2), phase, font=pill, fill=BG, anchor="mm")
+        x0 += pw + px(20)
+    tfont = _font(px(40), bold=True)
+    d.text((x0, top // 2), _fit(d, title, tfont, max(right - x0, px(100))), font=tfont,
+           fill=TEXT, anchor="lm")
+
+    # Standings.
+    strip = px(44)
+    body_top, body_bot = top + px(16), h - strip - px(12)
+    standings = (race or {}).get("standings") or []
+    if not standings:
+        d.text((w // 2, (body_top + body_bot) // 2),
+               "Waiting for the next heat" if not race else "No racers on the grid",
+               font=_font(px(40)), fill=DIM, anchor="mm")
+    else:
+        cols = [("POS", 0.03, "l"), ("RACER", 0.10, "l"), ("LAPS", 0.60, "r"),
+                ("TIME", 0.72, "r"), ("LAST", 0.84, "r"), ("BEST", 0.97, "r")]
+        rows = standings[:12]
+        hdr_h = px(36)
+        row_h = min(px(72), (body_bot - body_top - hdr_h) // max(len(rows), 1))
+        hfont = _font(px(18), bold=True)
+        for name, fx, al in cols:
+            d.text((int(w * fx), body_top + hdr_h // 2), name, font=hfont, fill=DIM,
+                   anchor="lm" if al == "l" else "rm")
+        rfont = _font(int(row_h * 0.5), bold=True)
+        nfont = _font(int(row_h * 0.5), mono=True)
+        best = min((r.get("bestLapMs") for r in rows if r.get("bestLapMs")), default=None)
+        racing = race.get("phase") in ("running", "finishing", "finished")
+        for i, r in enumerate(rows):
+            y0 = body_top + hdr_h + i * row_h
+            if i % 2 == 0:
+                d.rectangle((px(12), y0, w - px(12), y0 + row_h - px(4)), fill=CARD)
+            yc = y0 + (row_h - px(4)) // 2
+            pos = r.get("place") or (i + 1 if racing else r.get("grid") or i + 1)
+            d.text((int(w * 0.03), yc), str(pos), font=rfont,
+                   fill=BRAND if pos == 1 and racing else TEXT, anchor="lm")
+            name = r.get("racerName") or str(r.get("transponder") or "?")
+            d.text((int(w * 0.10), yc), _fit(d, name, rfont, int(w * 0.42)), font=rfont,
+                   fill=TEXT, anchor="lm")
+            if racing:
+                cells = [(0.60, str(r.get("laps") or 0), TEXT),
+                         (0.72, _total(r.get("totalMs")), TEXT),
+                         (0.84, _laptime(r.get("lastLapMs")), DIM),
+                         (0.97, _laptime(r.get("bestLapMs")),
+                          OKC if best and r.get("bestLapMs") == best else TEXT)]
+                for fx, txt, c in cells:
+                    d.text((int(w * fx), yc), txt, font=nfont, fill=c, anchor="rm")
+        if len(standings) > len(rows):
+            d.text((w - px(16), body_bot), f"+{len(standings) - len(rows)} more",
+                   font=_font(px(16)), fill=DIM, anchor="rd")
+
+    # Bottom strip: small network + health line.
+    found = problems(st)
+    d.rectangle((0, h - strip, w, h), fill=(58, 20, 20) if found else CARD)
+    d.line((0, h - strip, w, h - strip), fill=BAD if found else EDGE, width=max(1, px(2)))
+    sfont = _font(px(18))
+    x, y = px(16), h - strip // 2
+    d.text((x, y), st.host, font=_font(px(18), bold=True), fill=TEXT, anchor="lm")
+    x += int(d.textlength(st.host, font=_font(px(18), bold=True))) + px(24)
+    for text, c in status_strip(st):
+        text = _fit(d, text, sfont, max(w - x - px(16), px(40)))
+        d.text((x, y), text, font=sfont, fill=c, anchor="lm")
+        x += int(d.textlength(text, font=sfont)) + px(28)
+        if x >= w - px(40):
+            break
+    return img
+
+
 def to_rgb565(img) -> bytes:
     """Pillow has no RGB565 packer: build the two bytes per pixel with C-speed ops."""
     from PIL import Image, ImageChops
@@ -509,7 +658,24 @@ def find_framebuffer(wait_s: float = 0.0, sleep=time.sleep) -> str | None:
         sleep(1)
 
 
+def find_screens(wait_s: float = 0.0, sleep=time.sleep) -> list[tuple[str, str]]:
+    """Every screen to draw on as (device, layout): "lcd" for an SPI LCD
+    (fbtft drivers are named "fb_*"), "hdmi" for the rest. STATUS_FB forces a
+    single screen. With wait_s, give the LCD that long to appear at boot."""
+    if FB_DEV:
+        name = pathlib.Path(FB_DEV).name
+        kind = "lcd" if _read(SYS / "class/graphics" / name / "name").startswith("fb_") else "hdmi"
+        return [(FB_DEV, kind)]
+    deadline = time.monotonic() + wait_s
+    while True:
+        fbs = _framebuffers()
+        if any(n.startswith("fb_") for _, n in fbs) or time.monotonic() >= deadline:
+            return [(f"/dev/{dev}", "lcd" if n.startswith("fb_") else "hdmi") for dev, n in fbs]
+        sleep(1)
+
+
 def open_framebuffer() -> Framebuffer | None:
+    """The single preferred screen (kept for callers that want just one)."""
     if os.environ.get("STATUS_MODE", "auto") == "text":
         return None
     try:
@@ -520,15 +686,37 @@ def open_framebuffer() -> Framebuffer | None:
         return None
 
 
+def open_screens() -> list[tuple[Framebuffer, str]]:
+    if os.environ.get("STATUS_MODE", "auto") == "text":
+        return []
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        return []
+    out = []
+    for dev, kind in find_screens(LCD_WAIT_S):
+        try:
+            out.append((Framebuffer(dev), kind))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def draw_for(st: State, fb: Framebuffer, kind: str):
+    return draw_screen(st) if kind == "lcd" else draw_hdmi(st, fb.width, fb.height)
+
+
 def main() -> int:
-    fb = open_framebuffer()
-    if fb:
+    screens = open_screens()
+    if screens:
         import signal
         _console_mode(KD_GRAPHICS)
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         try:
             while True:
-                fb.show(draw_screen(collect()))
+                st = collect()
+                for fb, kind in screens:
+                    fb.show(draw_for(st, fb, kind))
                 time.sleep(INTERVAL_S)
         finally:
             _console_mode(KD_TEXT)
