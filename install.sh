@@ -8,7 +8,8 @@
 # Plain bash, no Ansible. What it does:
 #
 #   1. Checks      arm64 Pi, Raspberry Pi OS Trixie (Debian 13+) or Ubuntu 24.04+,
-#                  run with sudo by a normal user, wired network up
+#                  run with sudo by a normal user, wired network up, apt not
+#                  busy with automatic updates (fails fast instead of waiting)
 #   2. Packages    curl, jq, python3, nftables, ...
 #   3. Decoder     OpenStint (upstream .deb, or built from a pinned commit on
 #                  Ubuntu), /etc/openstint.conf, openstint-learn, USB access
@@ -173,16 +174,23 @@ usage() { sed -n '4,/^# SPDX/{/^# SPDX/d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}" 
     || echo "See the header of install.sh in ${INSTALL_REPO}"; }
 
 # apt-get without questions; quiet unless it fails.
+#   check_apt has already made sure apt was free and paused the automatic
+#   updates, so a lock that is still held after 2 minutes means something is
+#   wrong; fail rather than sit silently. Network timeouts stop a dead mirror
+#   from hanging the install, and NEEDRESTART_MODE stops Ubuntu's "restart
+#   services?" dialog.
+APT_OPTS=(-q -o DPkg::Lock::Timeout=120 -o Acquire::http::Timeout=30
+          -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
+apt_get() { DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get "${APT_OPTS[@]}" "$@"; }
+
 apt_install() {
-    # Lock timeout: a fresh Pi is often still running unattended-upgrades.
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q -o DPkg::Lock::Timeout=600 \
-        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" >/dev/null
+    apt_get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" >/dev/null
 }
 
 APT_UPDATED=0
 apt_update() {
     if [[ $APT_UPDATED -eq 0 ]]; then
-        apt-get update -q -o DPkg::Lock::Timeout=600 >/dev/null
+        apt_get update >/dev/null
         APT_UPDATED=1
     fi
 }
@@ -340,6 +348,70 @@ check_network() {
     curl -sS -m 10 -o /dev/null https://ghcr.io/v2/ 2>/dev/null \
         || die "Can't reach ghcr.io. Check the Pi's internet connection."
     ok "Internet over ${route_if:-?}"
+}
+
+# Fail fast when apt is busy or broken, instead of waiting behind it.
+# A freshly imaged Pi usually runs its first automatic upgrade within minutes
+# of booting, and that can hold apt for a long time.
+readonly APT_LOCKS=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+                    /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
+readonly APT_TIMERS=(apt-daily.timer apt-daily-upgrade.timer)
+APT_TIMERS_PAUSED=()
+
+# "PID command" for every process holding an apt/dpkg lock (from /proc/locks).
+apt_lock_holders() {
+    local f inode pid
+    local -A seen=()
+    for f in "${APT_LOCKS[@]}"; do
+        [[ -e $f ]] || continue
+        inode=$(stat -c %i "$f")
+        while read -r pid; do
+            [[ $pid =~ ^[0-9]+$ && -z ${seen[$pid]:-} ]] || continue
+            seen[$pid]=1
+            ps -o pid=,args= -p "$pid" 2>/dev/null | cut -c1-100 || true
+        done < <(awk -v ino="$inode" '$2 != "->" { n = split($6, d, ":"); if (d[n] == ino) print $5 }' /proc/locks)
+    done
+}
+
+check_apt() {
+    local holders running=() unit
+    holders=$(apt_lock_holders)
+    for unit in apt-daily.service apt-daily-upgrade.service; do
+        systemctl is-active --quiet "$unit" 2>/dev/null && running+=("$unit")
+    done
+    if [[ -n $holders || ${#running[@]} -gt 0 ]]; then
+        local busy=""
+        local line
+        while read -r line; do
+            [[ -n $line ]] && busy+="    ${line}"$'\n'
+        done <<<"$holders"
+        [[ ${#running[@]} -gt 0 ]] && busy+="    running: ${running[*]}"$'\n'
+        die "apt is busy, most likely with automatic updates (normal on a freshly imaged Pi).
+${busy}  Either wait for it to finish (usually 5-15 minutes) and run this again, or stop it now:
+    sudo systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service
+  and run this again."
+    fi
+
+    if [[ -n $(dpkg --audit 2>/dev/null) || -n $(ls -A /var/lib/dpkg/updates 2>/dev/null) ]]; then
+        die "An earlier package install was interrupted, so apt can't install anything.
+  Fix it with:  sudo dpkg --configure -a
+  then run this again."
+    fi
+
+    # Keep the automatic updates from starting halfway through the install.
+    # They're turned back on when the installer exits, even if it fails.
+    for unit in "${APT_TIMERS[@]}"; do
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            systemctl stop "$unit" && APT_TIMERS_PAUSED+=("$unit")
+        fi
+    done
+    trap resume_apt_timers EXIT
+    ok "apt is free${APT_TIMERS_PAUSED[*]:+ (automatic updates paused until the install ends)}"
+}
+
+resume_apt_timers() {
+    [[ ${#APT_TIMERS_PAUSED[@]} -gt 0 ]] && systemctl start "${APT_TIMERS_PAUSED[@]}" 2>/dev/null
+    return 0
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -866,7 +938,7 @@ setup_docker() {
     done
     if [[ ${#conflicts[@]} -gt 0 ]]; then
         info "Removing packages that clash with Docker Engine: ${conflicts[*]}"
-        DEBIAN_FRONTEND=noninteractive apt-get remove -y -q -o DPkg::Lock::Timeout=600 "${conflicts[@]}" >/dev/null
+        apt_get remove -y "${conflicts[@]}" >/dev/null
     fi
 
     local url="https://download.docker.com/linux/${OS_ID}"
@@ -1340,6 +1412,7 @@ main() {
     printf '\n--- %s  install.sh %s ---\n' "$(date -Is)" "$*" >>"$LOG_FILE"
     check_platform
     check_network
+    check_apt
 
     step "Packages"
     install_base_packages

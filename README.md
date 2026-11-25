@@ -48,6 +48,12 @@ curl -fsSL https://www.rcracehq.com/lapcounter/install.sh \
 | `--lcd MODEL` | left as is | Set up a small SPI LCD on the GPIO header: `waveshare35a` (Waveshare / SpotPear 3.5" RPi LCD (A), incl. V3). `none` removes one set up earlier. Reboot once afterwards. See [Small LCD](#small-lcd). |
 | `--lcd-rotate DEG` | `270` | LCD rotation: `0`, `90`, `180` or `270`. |
 
+**Freshly imaged Pi?** It usually runs its automatic updates in the first
+10-15 minutes after booting. The installer checks for that first and stops
+straight away with "apt is busy" (and the command to stop the updates) instead
+of waiting behind them. While it runs, it pauses the automatic updates and
+turns them back on when it finishes.
+
 `install.sh` is plain bash. Re-run it to update or change options; finished
 steps are skipped. Prefer to read it first? `curl -fsSLO …/install.sh`, read
 it, then `sudo bash install.sh`. Full log: `/var/log/lapcounter-install.log`.
